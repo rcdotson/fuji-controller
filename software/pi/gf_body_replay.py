@@ -35,6 +35,19 @@ Wiring (lens pad numbering per fuji-G-mount/electrical/README.md; all logic 3.3V
 Enable SPI on the Pi (dtparam=spi=on in /boot/firmware/config.txt) and install
 python3-spidev.
 
+During the idle session (tty only), keys drive the lens:
+    iris:  `]` stop down a third-stop, `[` open up, `o` wide open (1),
+           `c` fully closed (22)
+    focus: `.`/`,` step the motor +/-50 counts, `>`/`<` +/-500
+    `q` quits
+Iris setpoints are staged with 0x18 and latched with the 3f execute, each
+followed by a feedback poll (00 01 08 82) reading back the landed index.
+Focus moves use the captured 10-slot 0x15 sequence (envelope, speed 288,
+absolute signed 16-bit target, execute); position feedback (0x08 tag 1)
+prints as it streams in during actuation and seeds subsequent moves. The
+first focus move starts from position 0 unless feedback has been seen —
+expect a jump toward the infinity end on the first press.
+
 Usage:
     python3 gf_body_replay.py                     # real hardware, 10s idle
     python3 gf_body_replay.py --idle-seconds 30
@@ -82,6 +95,17 @@ STATUS_POLL = pkt(0x00, 0x00, 0x08)          # 00 00 08 20
 POLL_09 = pkt(0x00, 0x00, 0x09, tag2=2)      # 00 00 09 a6
 FOCUS_POLL = pkt(0x00, 0x00, 0x0C, tag2=2)   # 00 00 0c b2
 APERTURE_POLL = pkt(0x00, 0x00, 0x0C)        # 00 00 0c 30
+IRIS_FEEDBACK = pkt(0x00, 0x01, 0x08, tag2=2)  # 00 01 08 82: iris state poll
+SYNC_EXECUTE = pkt(0x00, 0x00, 0x3F, tag2=3)   # 00 00 3f c6: execute/latch
+ACK_BF = pkt(0x08, 0x00, 0xBF, tag2=3)         # 08 00 bf d8
+
+
+def iris_setpoint(index: int) -> bytes:
+    """0x18 staged iris setpoint: index 1 (wide open) .. 22 (fully closed),
+    third-stop steps; encoding per protocol README Aperture Drive section
+    (BE16 payload = 0x1000 + (index-1)*0x40, e.g. 10 00 18 a8 = index 1)."""
+    v = 0x1000 + (index - 1) * 0x40
+    return pkt(v >> 8, v & 0xFF, 0x18, tag2=2)
 # Transport resync marker: when the lens loses transport sync (protocol
 # violation, or fresh out of reset) it streams this word — a classic line-sync
 # pattern of bit-complement pairs — until the body answers with the
@@ -157,6 +181,39 @@ class SpiLink:
     def close(self) -> None:
         if self.spi:
             self.spi.close()
+
+
+# ---------------------------------------------------------------------------
+# Keyboard (non-blocking single-key input during the idle session)
+# ---------------------------------------------------------------------------
+
+class Keyboard:
+    """Raw-mode stdin poller; inert when stdin is not a tty (pipes, dry runs
+    under automation). Call restore() before the process exits."""
+
+    def __init__(self):
+        self.enabled = sys.stdin.isatty()
+        self.saved = None
+        if self.enabled:
+            import termios  # noqa: PLC0415 -- POSIX-only, matches deployment
+            import tty      # noqa: PLC0415
+            self.fd = sys.stdin.fileno()
+            self.saved = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+
+    def poll(self) -> str | None:
+        if not self.enabled:
+            return None
+        import select  # noqa: PLC0415
+        if select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.read(1)
+        return None
+
+    def restore(self) -> None:
+        if self.saved is not None:
+            import termios  # noqa: PLC0415
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+            self.saved = None
 
 
 # ---------------------------------------------------------------------------
@@ -426,8 +483,82 @@ def transport_reset(sess: BodySession) -> bool:
     return False
 
 
+def run_sequence(sess: BodySession, seq: list[bytes]) -> list[bytes] | None:
+    """Send a staged control sequence slot by slot, honoring busy flags
+    (repeat the same packet until the ack is clean). Returns the responses,
+    or None if the lens dropped to the resync marker mid-sequence."""
+    responses: list[bytes] = []
+    busy = 0
+    i = 0
+    while i < len(seq):
+        tx = seq[i]
+        time.sleep(INTRA_BURST_GAP_S)
+        rx = sess.xfer(tx)
+        if rx == MAGIC_WORD:
+            return None
+        responses.append(rx)
+        if (valid_pkt(rx) and any(rx) and rx[2] & 0x80
+                and rx[1] & 0x10 and busy < 8):
+            busy += 1
+            continue
+        i += 1
+    return responses
+
+
+def command_iris(sess: BodySession, index: int) -> bool:
+    """Stage and latch an iris setpoint (first proven control write).
+
+    Sequence synthesized from the README's Aperture Drive notes and the
+    captured 0x15 motor-drive pattern: stage the 0x18 setpoint, frame it
+    with a transport packet, latch with the 3f execute, ack via the
+    counter-carrying 0x98 path, and close on the lens's bf execute-response
+    and 3f echo. Returns True when the lens echoed the staged command or
+    the execute (its documented accept signals)."""
+    staged = iris_setpoint(index)
+    n = sess.next_counter(), sess.next_counter()
+    seq = [staged, transport(n[0]), SYNC_EXECUTE,
+           pkt(n[1], 0x00, 0x98, tag2=2), IDLE_PKT, ACK_BF]
+    responses = run_sequence(sess, seq)
+    if responses is None:
+        return False
+    return any(rx == staged or rx == SYNC_EXECUTE
+               or (valid_pkt(rx) and (rx[2] & 0x7F) == 0x3F)
+               for rx in responses)
+
+
+FOCUS_SPEED_288 = pkt(0x01, 0x20, 0x15, tag2=1)  # 01 20 15 40: manual speed
+
+
+def command_focus(sess: BodySession, target: int,
+                  prev: int | None) -> bool:
+    """Drive the focus motor to an absolute position (signed 16-bit counts).
+
+    Exact 10-slot sequence from the manual-focus bursts in
+    focus_ring_back_forth.txt: tag0 envelope (move budget ~= 2500 + 2.2 x
+    |travel|, fitted from 44 captured sequences), transport frame, tag1
+    speed (288, the manual-focus constant), counter-carrying 0x95 acks for
+    each stage, tag2 target, the 3f execute, and the bf close."""
+    delta = abs(target - prev) if prev is not None else 0
+    env = min(20000, 2500 + (delta * 11) // 5)
+    tb = target.to_bytes(2, "big", signed=True)
+    envelope = pkt(env >> 8, env & 0xFF, 0x15)
+    staged = pkt(tb[0], tb[1], 0x15, tag2=2)
+    seq = [envelope, transport(sess.next_counter()),
+           FOCUS_SPEED_288, pkt(sess.next_counter(), 0x00, 0x95),
+           staged, pkt(sess.next_counter(), 0x00, 0x95, tag2=1),
+           SYNC_EXECUTE, pkt(sess.next_counter(), 0x00, 0x95, tag2=2),
+           IDLE_PKT, ACK_BF]
+    responses = run_sequence(sess, seq)
+    if responses is None:
+        return False
+    return any(rx in (envelope, FOCUS_SPEED_288, staged)
+               or (valid_pkt(rx) and (rx[2] & 0x7F) == 0x3F)
+               for rx in responses)
+
+
 def run_idle(sess: BodySession, duration: float,
-             replay: list[dict] | None = None) -> None:
+             replay: list[dict] | None = None,
+             kb: Keyboard | None = None) -> None:
     """Adaptive idle loop built from request quads.
 
     The real body frames EVERY request the same way (ground truth:
@@ -452,6 +583,10 @@ def run_idle(sess: BodySession, duration: float,
     """
     print(f"entering idle loop for {duration:.0f}s "
           "(request quads @40ms, 0x09 every third burst)...")
+    if kb and kb.enabled:
+        print("  iris:  ] stop down   [ open up   o wide open   c closed\n"
+              "  focus: . far +50   , near -50   > far +500   < near -500\n"
+              "  q quits")
     deadline = time.perf_counter() + duration
     sess.start_phase()
     burst_i = 0
@@ -459,6 +594,12 @@ def run_idle(sess: BodySession, duration: float,
     magic_mode = False
     resync_cooldown = 0  # bursts to wait before re-attempting recovery
     reset_fails = 0      # consecutive failed reset dialogues before re-init
+    iris_target: int | None = None
+    pending_iris = False
+    want_feedback = False
+    focus_target: int | None = None
+    focus_pos: int | None = None
+    pending_focus = False
     next_burst = IDLE_PERIOD_S
 
     def handle(rx: bytes) -> list[bytes]:
@@ -467,6 +608,23 @@ def run_idle(sess: BodySession, duration: float,
         cmd = rx[2] & 0x7F
         reqs: list[bytes] = []
         if cmd == 0x08:
+            if rx[3] >> 6 == 2:
+                # iris feedback (response to 00 01 08 82): b0 low 5 bits are
+                # the iris index, top 3 are flags (README Aperture Drive)
+                print(f"  t={sess.now():8.3f} iris state: "
+                      f"index={rx[0] & 0x1F} flags={rx[0] >> 5:03b} "
+                      f"aux={rx[1]:02x} (raw {rx.hex(' ')})")
+                return reqs
+            if rx[3] >> 6 == 1:
+                # focus position feedback (tag 1, signed BE16; 32767 is the
+                # encoder's out-of-range sentinel)
+                nonlocal focus_pos
+                pos = int.from_bytes(rx[:2], "big", signed=True)
+                if pos != 32767:
+                    focus_pos = pos
+                print(f"  t={sess.now():8.3f} focus position: {pos} "
+                      f"(raw {rx.hex(' ')})")
+                return reqs
             status = describe_status(rx)
             if status and status != last_status:
                 print(f"  t={sess.now():8.3f} lens status: {status}")
@@ -494,9 +652,35 @@ def run_idle(sess: BodySession, duration: float,
 
     while time.perf_counter() < deadline:
         sess.wait_until(next_burst)
+
+        key = kb.poll() if kb else None
+        if key == "q":
+            print("  'q' pressed — ending session")
+            break
+        if key in ("[", "]", "o", "c"):
+            cur = iris_target or 1
+            new = {"o": 1, "c": 22,
+                   "]": min(22, cur + 1),
+                   "[": max(1, cur - 1)}[key]
+            if new != iris_target:
+                iris_target = new
+                pending_iris = True
+        if key in (",", ".", "<", ">"):
+            # base the first move on live position feedback if we have it
+            base = focus_target if focus_target is not None else \
+                (focus_pos if focus_pos is not None else 0)
+            step = {",": -50, ".": 50, "<": -500, ">": 500}[key]
+            new = max(-32768, min(32767, base + step))
+            if new != focus_target:
+                focus_target = new
+                pending_focus = True
+
         requests = [STATUS_POLL]
         if burst_i % 3 == 0:
             requests.append(POLL_09)
+        if want_feedback:
+            requests.append(IRIS_FEEDBACK)
+            want_feedback = False
         issued: set[bytes] = set(requests)
         hit_magic = False
         quads = 0
@@ -540,6 +724,30 @@ def run_idle(sess: BodySession, duration: float,
                     if r not in issued:
                         issued.add(r)
                         requests.append(r)
+
+        if pending_iris and not hit_magic and not magic_mode:
+            # control writes ride at the end of a burst, after the polls,
+            # like the captured body's 0x15 drive sequences do
+            pending_iris = False
+            time.sleep(INTRA_BURST_GAP_S)
+            staged = iris_setpoint(iris_target)
+            print(f"  t={sess.now():8.3f} commanding iris to index "
+                  f"{iris_target} ({staged.hex(' ')})")
+            if command_iris(sess, iris_target):
+                print(f"  t={sess.now():8.3f} iris command accepted")
+                want_feedback = True
+            else:
+                print(f"  t={sess.now():8.3f} iris command not acknowledged")
+
+        if pending_focus and not hit_magic and not magic_mode:
+            pending_focus = False
+            time.sleep(INTRA_BURST_GAP_S)
+            print(f"  t={sess.now():8.3f} commanding focus to {focus_target} "
+                  f"(from {focus_pos if focus_pos is not None else 'unknown'})")
+            if command_focus(sess, focus_target, focus_pos):
+                print(f"  t={sess.now():8.3f} focus command accepted")
+            else:
+                print(f"  t={sess.now():8.3f} focus command not acknowledged")
 
         if hit_magic:
             if not magic_mode:
@@ -633,6 +841,7 @@ def main() -> None:
 
     link = SpiLink(args.bus, args.device, args.dry_run)
     sess = BodySession(link, args.transcript)
+    kb = Keyboard()
     try:
         ok = run_startup_with_retry(sess, replay, args.settle,
                                     max(0, args.startup_retries),
@@ -643,10 +852,11 @@ def main() -> None:
             print("aborting before idle loop (no lens response)")
             sys.exit(1)
         sess.counter = next_counter_after(replay)
-        run_idle(sess, args.idle_seconds, replay)
+        run_idle(sess, args.idle_seconds, replay, kb)
     except KeyboardInterrupt:
         print("\ninterrupted")
     finally:
+        kb.restore()
         sess.close()
         if args.transcript:
             print(f"transcript written to {args.transcript}")
