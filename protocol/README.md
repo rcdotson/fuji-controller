@@ -240,7 +240,114 @@ The payload value seems relatively stable/constant across most captures, when it
 
 > TODO: Work out what this actually represents?
 
+> Update (2026-08, GF250 + Pi body emulation): the payload sat at a constant `00 18` through a full 15s session, completely unchanged by focus-ring rotation in either direction. A rotation-rate interpretation therefore looks doubtful for the GF250 — possibly a per-model constant or configuration/state value.
 
+
+## Transport Framing & Error Recovery
+
+Findings from driving a live GF250 with a Pi body emulator
+(`software/pi/gf_body_replay.py`), 2026-08. Unlike most sections above,
+these are verified by experiment against the lens — violate the rule and
+the lens objects; follow it and a synthesized session runs indefinitely —
+not inferred from passive captures alone.
+
+### Request quads
+
+The body frames **every** request the same way, a 4-transaction "quad":
+
+| Slot | Camera                   | Lens                                 |
+| ---- | ------------------------ | ------------------------------------ |
+| 1    | `<request>`              | (previous traffic / zeros)           |
+| 2    | `n 10 80 ??` (transport) | ACK of the request (`08 00 8c 84`…)  |
+| 3    | `00 00 00 00`            | response payload                     |
+| 4    | ACK of the payload       | `n 00 80 ??` (transport ACK of `n`)  |
+
+The 4- and 6-transaction idle bursts and the ring-service bursts in
+`focus_ring_back_forth.txt` (sizes 4, 12, 18, 30…) are all stacked quads.
+This is an enforced transport invariant, not a convention: issuing a second
+request while a quad is open — e.g. two `0x0c` polls back-to-back sharing
+one transport packet — makes the lens emit error report `00 26 03 f6` and
+drop to the resync marker. With correct quad framing, a GF250 ran 15+
+seconds of fully synthesized idle (status, `0x09`, ring readouts) with zero
+errors.
+
+Counter continuity, on the other hand, is apparently *not* enforced: an
+engine bug that skipped 3 transport counters per quad ran without complaint
+from the lens. The body is strictly sequential, but the lens seems to treat
+`n` as an opaque frame label.
+
+### Busy flow control
+
+`b1` bit `0x10` set inside an ACK packet (e.g. `08 10 8c 94` instead of
+`08 00 8c 84`) is a **busy/not-ready flag**. The body's response, from the
+one occurrence in `focus_ring_back_forth.txt`, is to repeat the *same*
+transport packet — same counter — until the ACK comes back clean, then
+continue the quad normally:
+
+```
+tx 00 00 0c b2       focus poll
+tx 0c 10 80 02       rx 08 10 8c 94     busy
+tx 0c 10 80 02       rx 08 10 8c 94     repeat, same counter
+tx 0c 10 80 02       rx 08 10 8c 94     repeat
+tx 0c 10 80 02       rx 08 00 8c 84     clean — proceed
+tx 00 00 00 00       rx ff fe 0c ac     payload (-2)
+tx 08 00 8c 84       rx 0c 00 80 32     close quad
+```
+
+Ignoring the flag and pressing on is a transport violation: the lens
+answers `00 00 03 d0` (error code `0x00`) and drops to the resync marker.
+This retroactively explains a whole family of desyncs where the lens sent
+a flagged ACK variant (`08 10 86 3a`, `08 10 88 02`, `08 10 a8 06`, …)
+immediately before dying — it was asking the body to wait. Verified live
+on the GF250: with busy-retry implemented, sustained focus + aperture ring
+sessions run clean.
+
+### Resync marker `c3 3c a5 5a`
+
+When the lens loses transport sync (any framing/protocol violation), and
+also briefly at power-on before first contact, it answers **every**
+transaction with the 32-bit word `c3 3c a5 5a` until the body resets the
+transport:
+
+- The word is a line-sync pattern — `c3`/`3c` and `a5`/`5a` are
+  bit-complement pairs — and is not a valid check5 packet, so it cannot be
+  mistaken for data.
+- The lens application stays alive in this state. Bus silence does *not*
+  clear it (verified with repeated 1.4s quiet windows, SCLK low); it
+  streams the marker indefinitely. Only the reset dialogue (or a power
+  cycle) recovers it.
+- The firmware update section's "magic handshake" is this same mechanism:
+  a generic transport reset the body performs before the block transfers,
+  not an update-specific packet.
+
+The reset dialogue (from the fw-update capture, confirmed live):
+
+```
+tx a5 5a 3c c3       counterpart marker
+tx 80 20 28 24       0x28 session reset
+tx 08 10 80 22       fresh transport — counters restart at 8
+rx 08 00 a8 36       lens ACKs the 0x28 (body ACKs this back)
+rx 00 f3 03 e8       lens error report — must be ACKed like any
+                     packet, framed with its own transport packet
+```
+
+Leaving that `0x03` report unACKed — or ACKing it without a transport
+frame — keeps the lens in marker state; several recovery attempts failed
+exactly this way before the quad rule was understood.
+
+### `0x03` error reports
+
+`b0 b1 03 ??` (tag2=3) packets are error/exception reports from the lens.
+`b1` codes observed so far:
+
+| Code   | Context                                                        |
+| ------ | -------------------------------------------------------------- |
+| `0x00` | as the lens falls out of sync (`00 00 03 d0` right before marker streaming begins — seen when a busy flag was ignored and the quad left unclosed) |
+| `0x26` | request issued without its own transport frame (quad violation) |
+| `0xf3` | reported after the transport reset dialogue completes           |
+
+They are regular packets and expect a regular, quad-framed ACK
+(`08 00 83 ??` with tag2=3).
 
 
 ## Identification Packets
@@ -508,6 +615,20 @@ rx 0e 00 80 02       Possible status update
 ```
 
 The `0c` is also used for the iris control ring. For focus packets, the **top two bits of the last byte are always high** (`bit 6..7 = 11`).
+
+> Confirmed live (2026-08, GF250 + Pi body emulation): deltas are signed
+> 16-bit and track the physical ring in direction, step count, and timing
+> (`ff ff` = −1 during slow CCW turns, `00 01` = +1 turning back). The
+> readout's tag2 mirrors the poll's tag2 — `2` for focus (`00 00 0c b2`),
+> `0` for aperture (`00 00 0c 30`) — a cleaner discriminator than the
+> bit 6..7 observation above. Each poll must be framed as its own request
+> quad (see Transport Framing & Error Recovery). The **first** `0x0c`
+> readout after startup is not a delta: observed one-off values differ per
+> session (`7f ff` then `80 02` for focus; `00 07` then `00 06` for
+> aperture), so it looks like an absolute position/state snapshot rather
+> than a fixed sentinel — treat the first readout separately from the
+> delta stream. A busy-flagged ACK can precede any readout; see Busy flow
+> control.
 
 In the captures where the manual focus mode was active and the motor would move, we see additional `0x15` packets which are documented in the focus motor section.
 
@@ -843,7 +964,7 @@ There are two firmware `.DAT` files for that update, both share the same header 
     - After two packets, a ~145ms gap occurs presumably for writing a 4kB page.
 
 - Some kind of 'transfer running' low edge on capture CH2 during the bursts
-- New/update-specific packets, including a magic handshake `a5 5a 3c c3` / `c3 3c a5 5a`.
+- A marker exchange `a5 5a 3c c3` / `c3 3c a5 5a` before the transfer — originally read as an update-specific magic handshake, since identified as the generic transport reset (see Transport Framing & Error Recovery); the body runs it here to guarantee a clean transport before the block transfers.
 - Firmware transfer blocks appear to be shaped as a 2-byte block index + payload + trailing check byte.
 
 The rx side has the next expected block index, and all zeros otherwise during the long transfers and the same `5a` final byte.
@@ -883,11 +1004,11 @@ rx 00 00 00 00
 tx 08 10 80 22
 rx 08 02 80 14
 
-tx a5 5a 3c c3	magic word?
-rx c3 3c a5 5a	magic variant?
+tx a5 5a 3c c3	body counterpart marker (transport reset)
+rx c3 3c a5 5a	lens resync marker
 
 tx 80 20 28 24
-rx a5 5a 3c c3	ack magic
+rx a5 5a 3c c3	lens acks the marker exchange
 
 tx 08 10 80 22
 rx 08 00 a8 36
@@ -1127,6 +1248,10 @@ tx 0f 00 a0 0e
 
 Found during update process.
 
+This is how the parser classifies the lens resync marker `c3 3c a5 5a`
+(byte 2 = `a5`). Not a real command — see Transport Framing & Error
+Recovery.
+
 
 
 ### `0x28`
@@ -1157,6 +1282,10 @@ Seen during firmware update process
 ### `0x3c`
 
 Seen during firmware update capture
+
+This is how the parser classifies the body's counterpart marker
+`a5 5a 3c c3` (byte 2 = `3c`). Not a real command — see Transport Framing
+& Error Recovery.
 
 
 

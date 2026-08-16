@@ -8,14 +8,15 @@ fuji_spi.py) with the original timing, comparing live responses against the
 capture. Only the first --replay-end transactions are replayed: the capture's
 tail is state-dependent idle traffic, and canned ACKs there desync a live
 lens (it then answers everything with the c3 3c a5 5a resync word).
-Phase 2 (idle): synthesizes the body's polling loop adaptively — 40ms status
-bursts (0x09 poll every third), ACKs computed from the lens's actual packets
-(cmd | 0x80, matching tag2), and 0x0c follow-up polls when the lens status
-flags a pending focus/aperture ring readout. A lens beaconing c3 3c a5 5a
-has dropped to its bootloader (a desync does this); the recovery is a
-quiet-bus reboot — SCLK low, ~1.4s silence, startup prefix again. (The
-fw-update magic handshake is NOT a recovery: the lens acks it but that is
-the entry into firmware-update mode; see attempt_resync.)
+Phase 2 (idle): synthesizes the body's polling loop adaptively as request
+quads — every request (status, 0x09, 0x0c readout) framed as
+[request, transport(n), idle, ack], the invariant structure the real body
+uses (see focus_ring_back_forth.txt); ACKs are computed from the lens's
+actual packets (cmd | 0x80, matching tag2). A lens streaming c3 3c a5 5a
+has lost transport sync and wants the reset dialogue (counterpart marker,
+0x28 session reset, ACKs including its 0x03 error report — see
+transport_reset); if the marker persists after that, the startup prefix is
+re-run as escalation.
 
 Wiring (lens pad numbering per fuji-G-mount/electrical/README.md; all logic 3.3V):
 
@@ -55,7 +56,6 @@ SPI_SPEED_HZ = 1_500_000
 SPI_MODE = 3  # CPOL=1, CPHA=1
 INTRA_BURST_GAP_S = 0.0003   # gap between transactions within a burst
 IDLE_PERIOD_S = 0.040        # status burst period
-REBOOT_QUIET_S = 0         # bus quiet for a beaconing lens to boot its app
 BYTE_TIME_S = 8 / SPI_SPEED_HZ
 
 
@@ -82,12 +82,16 @@ STATUS_POLL = pkt(0x00, 0x00, 0x08)          # 00 00 08 20
 POLL_09 = pkt(0x00, 0x00, 0x09, tag2=2)      # 00 00 09 a6
 FOCUS_POLL = pkt(0x00, 0x00, 0x0C, tag2=2)   # 00 00 0c b2
 APERTURE_POLL = pkt(0x00, 0x00, 0x0C)        # 00 00 0c 30
-# Bootloader beacon: after a reset or transport desync the lens drops to its
-# bootloader and answers every transaction with this word (also the fw-update
-# handshake word). Not a valid check5 packet, so it never enters the ACK path.
+# Transport resync marker: when the lens loses transport sync (protocol
+# violation, or fresh out of reset) it streams this word — a classic line-sync
+# pattern of bit-complement pairs — until the body answers with the
+# counterpart and completes the reset dialogue (see transport_reset). The
+# fw-update capture uses the same exchange before its block transfers; it is
+# a generic transport reset, not update-specific. Not a valid check5 packet,
+# so it never enters the ACK path.
 MAGIC_WORD = bytes.fromhex("c33ca55a")
-MAGIC_REPLY = bytes.fromhex("a55a3cc3")      # body's side of the handshake
-PKT_2824 = pkt(0x80, 0x20, 0x28)             # 80 20 28 24, follows the magic
+MAGIC_REPLY = bytes.fromhex("a55a3cc3")      # body's counterpart marker
+PKT_2824 = pkt(0x80, 0x20, 0x28)             # 80 20 28 24: session reset
 
 
 def transport(n: int) -> bytes:
@@ -373,131 +377,204 @@ def describe_status(rx: bytes) -> str | None:
     return f"b0={rx[0]:02x} b1={rx[1]:02x} pending={'+'.join(names) or 'none'}"
 
 
-def attempt_resync(sess: BodySession) -> bool:
-    """Perform the magic handshake from the GF110 firmware-update capture
-    (body sends a5 5a 3c c3, then 80 20 28 24; the lens echo-acks with
-    a5 5a 3c c3 and reports 00 f3 03 e8).
+def transport_reset(sess: BodySession) -> bool:
+    """Complete the lens's transport-reset dialogue.
 
-    NOTE: tested on hardware 2026-08-16 — a beaconing lens acks this
-    reliably, but it is the ENTRY into firmware-update mode, not a transport
-    resync: the lens keeps beaconing at normal traffic afterwards, including
-    a full startup replay. Kept for future fw-update work; the working
-    recovery from beacon state is a quiet-bus reboot (see run_idle)."""
-    ok = False
-    for j, tx in enumerate((MAGIC_REPLY, PKT_2824, transport(0x08),
-                            IDLE_PKT, IDLE_PKT)):
-        if j:
+    A lens streaming the resync marker wants the full exchange the captured
+    body performs (fw-update capture, but the mechanism is generic): the
+    counterpart marker, the 0x28 session-reset, a fresh transport packet,
+    and ACKs for everything it answers — including the 0x03 error report
+    (e.g. 00 f3 03 e8) that earlier recovery attempts left unacknowledged,
+    which kept the lens in marker state. Every ACK is framed with its own
+    transport packet, matching the per-request framing the real body uses
+    everywhere. Success = the lens stopped streaming the marker and spoke
+    at least one valid packet."""
+    queue = [MAGIC_REPLY, PKT_2824, transport(0x08), IDLE_PKT,
+             pkt(0x08, 0x00, 0xA8)]  # 08 00 a8 36: ack of the lens's a8 reply
+    n = 9  # dialogue transport counters restart at 8; transport(8) used above
+    marker_free = 0
+    got_valid = False
+    slots = busy = 0
+    while (queue or marker_free < 3) and slots < 24:
+        tx = queue.pop(0) if queue else IDLE_PKT
+        if slots:
             time.sleep(INTRA_BURST_GAP_S)
         rx = sess.xfer(tx)
-        if rx == MAGIC_REPLY or (j >= 2 and valid_pkt(rx) and any(rx)):
-            ok = True
-    if ok:
-        sess.counter = 9  # the handshake's transport(8) consumed counter 8
-    return ok
+        slots += 1
+        if rx == MAGIC_WORD:
+            marker_free = 0
+            continue
+        marker_free += 1
+        if valid_pkt(rx) and any(rx):
+            got_valid = True
+            if rx[2] & 0x80:
+                # busy flag: repeat the same packet until the ack is clean
+                # (attempt_6 showed 08 10 a8 06 mid-dialogue — the lens
+                # asking us to wait, per the captured body's retry behavior)
+                if rx[1] & 0x10 and busy < 6:
+                    busy += 1
+                    queue.insert(0, tx)
+            else:
+                queue.extend([transport(n), ack_for(rx)])
+                n = 8 + ((n + 1 - 8) & 0x7)
+                if (rx[2] & 0x7F) == 0x03:
+                    print(f"  t={sess.now():8.3f} lens error report "
+                          f"{rx.hex(' ')} (code {rx[1]:02x}) — acked")
+    if got_valid and marker_free >= 3:
+        sess.counter = n
+        return True
+    return False
 
 
 def run_idle(sess: BodySession, duration: float,
              replay: list[dict] | None = None) -> None:
-    """Adaptive idle loop.
+    """Adaptive idle loop built from request quads.
 
-    Each 40ms burst starts with the status poll + transport packet (plus the
-    0x09 poll every third burst), then continues slot by slot, reacting to
-    what the lens actually sends: every valid non-ACK lens packet is ACKed
-    with its own cmd and tag2 (not a canned byte), and a status packet whose
-    b1 pending bits flag a ring readout gets the matching 0x0c follow-up
-    poll in the same burst. The burst ends after two quiet trailing slots
-    (or the slot cap), so its length breathes with the lens's traffic the
-    way the real body's bursts do.
+    The real body frames EVERY request the same way (ground truth:
+    focus_ring_back_forth.txt ring-service bursts):
 
-    The magic word means the lens has dropped to its bootloader (it beacons
-    c3 3c a5 5a until either a fw-update handshake or a reboot). Recovery
-    mirrors what works at power-on: SCLK low, ~1.4s of bus quiet so the
-    bootloader times out into the app (measured boot ~1.34s), then the
-    startup prefix again, then resume polling.
+        tx <request>      rx (previous traffic)
+        tx transport(n)   rx <lens ack of request>
+        tx 00 00 00 00    rx <response payload>
+        tx <ack payload>  rx <lens transport-ack of n>
+
+    A 40ms burst is a status quad, a 0x09 quad every third burst, and one
+    quad per 0x0c readout the status packet's pending bits request. Sending
+    requests without their own transport frame is a transport violation
+    (the lens answers with error 0x26 and drops to the resync marker) —
+    that was the pre-quad engine's instability.
+
+    The resync marker (c3 3c a5 5a) means the lens has lost transport sync
+    — its app is fine and waiting, so quiet time does nothing (verified:
+    3x 1.4s silences changed nothing). Recovery is protocol-level:
+    transport_reset completes the reset dialogue; a persistent marker
+    escalates to re-running the startup prefix.
     """
     print(f"entering idle loop for {duration:.0f}s "
-          "(adaptive bursts @40ms, 0x09 poll every third)...")
+          "(request quads @40ms, 0x09 every third burst)...")
     deadline = time.perf_counter() + duration
     sess.start_phase()
     burst_i = 0
     last_status = None
     magic_mode = False
-    resync_cooldown = 0  # bursts to wait before re-attempting the handshake
+    resync_cooldown = 0  # bursts to wait before re-attempting recovery
+    reset_fails = 0      # consecutive failed reset dialogues before re-init
     next_burst = IDLE_PERIOD_S
+
+    def handle(rx: bytes) -> list[bytes]:
+        """Decode a lens payload; return follow-up requests it asks for."""
+        nonlocal last_status
+        cmd = rx[2] & 0x7F
+        reqs: list[bytes] = []
+        if cmd == 0x08:
+            status = describe_status(rx)
+            if status and status != last_status:
+                print(f"  t={sess.now():8.3f} lens status: {status}")
+                last_status = status
+            pend = rx[1] & 0x7F
+            if pend & 0x08:
+                reqs.append(FOCUS_POLL)
+            if pend & 0x10:
+                reqs.append(APERTURE_POLL)
+        elif cmd == 0x0C:
+            # readout tag2 mirrors the poll's tag2: 2 = focus, 0 = aperture;
+            # value is a signed 16-bit delta (ff ff = -1 in the captures)
+            kind = {2: "focus", 0: "aperture"}.get(rx[3] >> 6, "ring?")
+            delta = int.from_bytes(rx[:2], "big", signed=True)
+            print(f"  t={sess.now():8.3f} {kind} ring: delta={delta:+d} "
+                  f"(raw {rx.hex(' ')})")
+        elif cmd == 0x09:
+            if rx[1]:
+                print(f"  t={sess.now():8.3f} 0x09 rate: "
+                      f"b0={rx[0]:02x} b1={rx[1]:02x}")
+        elif cmd == 0x03:
+            print(f"  t={sess.now():8.3f} lens error/desync report "
+                  f"({rx.hex(' ')}, code {rx[1]:02x})")
+        return reqs
 
     while time.perf_counter() < deadline:
         sess.wait_until(next_burst)
-        queue = [STATUS_POLL, transport(sess.next_counter())]
+        requests = [STATUS_POLL]
         if burst_i % 3 == 0:
-            queue.append(POLL_09)
+            requests.append(POLL_09)
+        issued: set[bytes] = set(requests)
+        hit_magic = False
+        quads = 0
+        first_slot = True
 
-        polled: set[bytes] = set()
-        slots = quiet = 0
-        while (queue or quiet < 2) and slots < 14:
-            tx = queue.pop(0) if queue else IDLE_PKT
-            if slots:
-                time.sleep(INTRA_BURST_GAP_S)
-            rx = sess.xfer(tx)
-            slots += 1
-
-            if rx == MAGIC_WORD:
-                if not magic_mode:
-                    magic_mode = True
-                    print(f"  t={sess.now():8.3f} lens dropped to bootloader "
-                          "(beacon) — transport lost")
-                if replay is not None and resync_cooldown == 0:
-                    print(f"  t={sess.now():8.3f} quiet-rebooting lens: SCLK "
-                          f"low, {REBOOT_QUIET_S:.1f}s silence, then startup")
-                    sess.link.disarm()
-                    time.sleep(REBOOT_QUIET_S)
-                    sess.link.arm()
-                    if run_startup(sess, replay):
+        while requests and quads < 5 and not hit_magic:
+            req = requests.pop(0)
+            quads += 1
+            payload = None
+            frame = transport(sess.next_counter())
+            plan = [req, frame, IDLE_PKT, None]  # None = ack slot
+            retries = 0
+            j = 0
+            while j < len(plan):
+                tx = plan[j]
+                if tx is None:
+                    tx = ack_for(payload) if payload else IDLE_PKT
+                if not first_slot:
+                    time.sleep(INTRA_BURST_GAP_S)
+                first_slot = False
+                rx = sess.xfer(tx)
+                if rx == MAGIC_WORD:
+                    hit_magic = True
+                    break
+                if valid_pkt(rx) and any(rx):
+                    if magic_mode:
                         magic_mode = False
-                        sess.counter = next_counter_after(replay)
+                        print(f"  t={sess.now():8.3f} lens left resync state")
+                    if rx[2] & 0x80:
+                        # b1 bit 0x10 on an ACK is the lens's busy/not-ready
+                        # flag; the captured body repeats the same packet
+                        # until the ack comes back clean
+                        if rx[1] & 0x10 and retries < 8:
+                            retries += 1
+                            continue
+                    else:
+                        payload = rx
+                j += 1
+            if payload:
+                for r in handle(payload):
+                    if r not in issued:
+                        issued.add(r)
+                        requests.append(r)
+
+        if hit_magic:
+            if not magic_mode:
+                magic_mode = True
+                print(f"  t={sess.now():8.3f} lens streaming resync marker "
+                      "— transport lost")
+            if resync_cooldown == 0:
+                time.sleep(INTRA_BURST_GAP_S)
+                if transport_reset(sess):
+                    print(f"  t={sess.now():8.3f} transport reset complete "
+                          "— resuming polling")
+                    magic_mode = False
+                    reset_fails = 0
+                else:
+                    reset_fails += 1
+                    if reset_fails <= 2 or replay is None:
+                        # give the lens a couple of bursts, then retry the
+                        # dialogue before reaching for a full re-init
+                        resync_cooldown = 2 if reset_fails <= 2 else 25
+                    else:
+                        reset_fails = 0
+                        print(f"  t={sess.now():8.3f} marker persists — "
+                              "re-running startup prefix")
+                        time.sleep(INTRA_BURST_GAP_S)
+                        ok = run_startup(sess, replay)
                         # run_startup reset the phase clock; realign the
-                        # burst schedule to it
+                        # burst schedule EITHER WAY (a stale schedule after
+                        # a failed re-init stalled attempt_6 for 2.1s)
                         next_burst = sess.phase_now()
                         burst_i = 0
-                    else:
-                        resync_cooldown = 25  # ~1s of polling between tries
-                break  # rest of this burst is moot either way
-            if not (valid_pkt(rx) and any(rx)):
-                if not queue:
-                    quiet += 1
-                continue
-            if magic_mode:
-                magic_mode = False
-                print(f"  t={sess.now():8.3f} lens left resync state")
-            if rx[2] & 0x80:
-                continue  # ACK from the lens (incl. n 00 80 transport acks)
-
-            quiet = 0
-            cmd = rx[2] & 0x7F
-            queue.append(ack_for(rx))
-            if cmd == 0x08:
-                status = describe_status(rx)
-                if status and status != last_status:
-                    print(f"  t={sess.now():8.3f} lens status: {status}")
-                    last_status = status
-                pend = rx[1] & 0x7F
-                if pend & 0x08 and FOCUS_POLL not in polled:
-                    polled.add(FOCUS_POLL)
-                    queue.append(FOCUS_POLL)
-                if pend & 0x10 and APERTURE_POLL not in polled:
-                    polled.add(APERTURE_POLL)
-                    queue.append(APERTURE_POLL)
-            elif cmd == 0x0C:
-                # readout tag2 mirrors the poll's tag2: 2 = focus, 0 = aperture
-                kind = {2: "focus", 0: "aperture"}.get(rx[3] >> 6, "ring?")
-                print(f"  t={sess.now():8.3f} {kind} ring: b0={rx[0]:02x} "
-                      f"b1={rx[1]:02x} (raw {rx.hex(' ')})")
-            elif cmd == 0x09:
-                if rx[1]:
-                    print(f"  t={sess.now():8.3f} 0x09 rate: "
-                          f"b0={rx[0]:02x} b1={rx[1]:02x}")
-            elif cmd == 0x03:
-                print(f"  t={sess.now():8.3f} lens error/desync report "
-                      f"({rx.hex(' ')})")
+                        if ok:
+                            magic_mode = False
+                            sess.counter = next_counter_after(replay)
+                        else:
+                            resync_cooldown = 25  # ~1s between attempts
 
         burst_i += 1
         if resync_cooldown:
