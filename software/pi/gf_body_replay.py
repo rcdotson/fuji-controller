@@ -38,13 +38,19 @@ python3-spidev.
 During the idle session (tty only), keys drive the lens:
     iris:  `]` stop down a third-stop, `[` open up, `o` wide open (1),
            `c` fully closed (22)
-    focus: `.`/`,` step the motor +/-50 counts, `>`/`<` +/-500
+    focus: `m`/`n` step the motor +/-2 counts, `.`/`,` +/-50, `>`/`<` +/-500
+    power: `1` lens power on, `2` off (GPIO6 -> external high-side switch;
+           raised automatically before the settle window at startup, driven
+           low again when the script exits)
     `q` quits
 Iris setpoints are staged with 0x18 and latched with the 3f execute, each
 followed by a feedback poll (00 01 08 82) reading back the landed index.
 Focus moves use the captured 10-slot 0x15 sequence (envelope, speed 288,
-absolute signed 16-bit target, execute); position feedback (0x08 tag 1)
-prints as it streams in during actuation and seeds subsequent moves. The
+absolute signed 16-bit target, execute). After every accepted move the
+position is actively polled with 00 01 08 42 (the tag-1 sibling of the
+iris feedback poll, seen in the ring-service captures) once per burst
+until two consecutive readings agree, printing each change and a final
+"focus settled at N"; the settled position seeds the next move. The
 first focus move starts from position 0 unless feedback has been seen —
 expect a jump toward the infinity end on the first press.
 
@@ -96,6 +102,7 @@ POLL_09 = pkt(0x00, 0x00, 0x09, tag2=2)      # 00 00 09 a6
 FOCUS_POLL = pkt(0x00, 0x00, 0x0C, tag2=2)   # 00 00 0c b2
 APERTURE_POLL = pkt(0x00, 0x00, 0x0C)        # 00 00 0c 30
 IRIS_FEEDBACK = pkt(0x00, 0x01, 0x08, tag2=2)  # 00 01 08 82: iris state poll
+FOCUS_POS_POLL = pkt(0x00, 0x01, 0x08, tag2=1)  # 00 01 08 42: focus position
 SYNC_EXECUTE = pkt(0x00, 0x00, 0x3F, tag2=3)   # 00 00 3f c6: execute/latch
 ACK_BF = pkt(0x08, 0x00, 0xBF, tag2=3)         # 08 00 bf d8
 
@@ -181,6 +188,59 @@ class SpiLink:
     def close(self) -> None:
         if self.spi:
             self.spi.close()
+
+
+# ---------------------------------------------------------------------------
+# Lens power (external high-side switch driven by a GPIO, active high)
+# ---------------------------------------------------------------------------
+
+class LensPower:
+    """Drives the external lens-power circuit via a GPIO (default GPIO6).
+
+    Uses lgpio directly: gpiozero's default chip lookup fails on this
+    kernel's renumbered gpiochips, so the RP1 header bank is found by its
+    54-line signature. The pin is claimed LOW (power off) at start; close()
+    drives it low again, so exiting the script cuts lens power."""
+
+    def __init__(self, gpio: int):
+        self.gpio = gpio
+        self.state = False
+        self.h = None
+        if gpio < 0:
+            return
+        try:
+            import lgpio  # noqa: PLC0415 -- only needed on the Pi
+        except ImportError:
+            print("lens power: python3-lgpio not available — disabled")
+            return
+        self._lgpio = lgpio
+        for chip in range(17):
+            try:
+                h = lgpio.gpiochip_open(chip)
+            except lgpio.error:
+                continue
+            if lgpio.gpio_get_chip_info(h)[1] >= 54:  # RP1 header bank
+                lgpio.gpio_claim_output(h, gpio, 0)
+                self.h = h
+                return
+            lgpio.gpiochip_close(h)
+        print("lens power: no 54-line gpiochip found — disabled")
+
+    @property
+    def enabled(self) -> bool:
+        return self.h is not None
+
+    def set(self, on: bool) -> None:
+        if self.h is not None:
+            self._lgpio.gpio_write(self.h, self.gpio, 1 if on else 0)
+            self.state = on
+
+    def close(self) -> None:
+        if self.h is not None:
+            self._lgpio.gpio_write(self.h, self.gpio, 0)
+            self._lgpio.gpio_free(self.h, self.gpio)
+            self._lgpio.gpiochip_close(self.h)
+            self.h = None
 
 
 # ---------------------------------------------------------------------------
@@ -497,10 +557,18 @@ def run_sequence(sess: BodySession, seq: list[bytes]) -> list[bytes] | None:
         if rx == MAGIC_WORD:
             return None
         responses.append(rx)
-        if (valid_pkt(rx) and any(rx) and rx[2] & 0x80
-                and rx[1] & 0x10 and busy < 8):
-            busy += 1
-            continue
+        if valid_pkt(rx) and any(rx) and rx[2] & 0x80:
+            if rx[1] & 0x10 and busy < 8:
+                busy += 1
+                continue  # busy flag: repeat the same packet
+            if rx[1] & ~0x10:
+                # unknown flag bits in an ack are the lens objecting (e.g.
+                # 0a 08 95 42 right before the marker drop in
+                # failed_at_about_3min.tsv); pressing on desyncs the
+                # transport, so abort the command instead
+                print(f"  t={sess.now():8.3f} lens flagged the sequence "
+                      f"({rx.hex(' ')}) — aborting command")
+                return None
         i += 1
     return responses
 
@@ -558,7 +626,8 @@ def command_focus(sess: BodySession, target: int,
 
 def run_idle(sess: BodySession, duration: float,
              replay: list[dict] | None = None,
-             kb: Keyboard | None = None) -> None:
+             kb: Keyboard | None = None,
+             power: LensPower | None = None) -> None:
     """Adaptive idle loop built from request quads.
 
     The real body frames EVERY request the same way (ground truth:
@@ -585,12 +654,13 @@ def run_idle(sess: BodySession, duration: float,
           "(request quads @40ms, 0x09 every third burst)...")
     if kb and kb.enabled:
         print("  iris:  ] stop down   [ open up   o wide open   c closed\n"
-              "  focus: . far +50   , near -50   > far +500   < near -500\n"
-              "  q quits")
+              "  focus: n/m -/+2   ,/. -/+50   </> -/+500   (- near, + far)\n"
+              "  power: 1 on   2 off      q quits")
     deadline = time.perf_counter() + duration
     sess.start_phase()
     burst_i = 0
     last_status = None
+    last_09: bytes | None = None
     magic_mode = False
     resync_cooldown = 0  # bursts to wait before re-attempting recovery
     reset_fails = 0      # consecutive failed reset dialogues before re-init
@@ -600,6 +670,8 @@ def run_idle(sess: BodySession, duration: float,
     focus_target: int | None = None
     focus_pos: int | None = None
     pending_focus = False
+    focus_poll_left = 0        # bursts of position polling after a move
+    focus_settle_prev: int | None = None
     next_burst = IDLE_PERIOD_S
 
     def handle(rx: bytes) -> list[bytes]:
@@ -617,13 +689,14 @@ def run_idle(sess: BodySession, duration: float,
                 return reqs
             if rx[3] >> 6 == 1:
                 # focus position feedback (tag 1, signed BE16; 32767 is the
-                # encoder's out-of-range sentinel)
+                # encoder's out-of-range/inactive sentinel)
                 nonlocal focus_pos
                 pos = int.from_bytes(rx[:2], "big", signed=True)
                 if pos != 32767:
+                    if pos != focus_pos:
+                        print(f"  t={sess.now():8.3f} focus position: {pos} "
+                              f"(raw {rx.hex(' ')})")
                     focus_pos = pos
-                print(f"  t={sess.now():8.3f} focus position: {pos} "
-                      f"(raw {rx.hex(' ')})")
                 return reqs
             status = describe_status(rx)
             if status and status != last_status:
@@ -642,9 +715,13 @@ def run_idle(sess: BodySession, duration: float,
             print(f"  t={sess.now():8.3f} {kind} ring: delta={delta:+d} "
                   f"(raw {rx.hex(' ')})")
         elif cmd == 0x09:
-            if rx[1]:
-                print(f"  t={sess.now():8.3f} 0x09 rate: "
+            # near-constant value (0x18/0x19 on the GF250, probably not a
+            # rotation rate); log only when it changes to avoid clutter
+            nonlocal last_09
+            if rx[:2] != last_09:
+                print(f"  t={sess.now():8.3f} 0x09 value changed: "
                       f"b0={rx[0]:02x} b1={rx[1]:02x}")
+                last_09 = rx[:2]
         elif cmd == 0x03:
             print(f"  t={sess.now():8.3f} lens error/desync report "
                   f"({rx.hex(' ')}, code {rx[1]:02x})")
@@ -657,6 +734,17 @@ def run_idle(sess: BodySession, duration: float,
         if key == "q":
             print("  'q' pressed — ending session")
             break
+        if key in ("1", "2"):
+            if power and power.enabled:
+                on = key == "1"
+                power.set(on)
+                print(f"  t={sess.now():8.3f} lens power "
+                      f"{'ON' if on else 'OFF'} (GPIO{power.gpio})")
+                if on:
+                    print("  (lens boots in ~1.4s; the marker recovery "
+                          "will re-init it)")
+            else:
+                print("  lens power control not available")
         if key in ("[", "]", "o", "c"):
             cur = iris_target or 1
             new = {"o": 1, "c": 22,
@@ -665,11 +753,12 @@ def run_idle(sess: BodySession, duration: float,
             if new != iris_target:
                 iris_target = new
                 pending_iris = True
-        if key in (",", ".", "<", ">"):
+        if key in ("n", "m", ",", ".", "<", ">"):
             # base the first move on live position feedback if we have it
             base = focus_target if focus_target is not None else \
                 (focus_pos if focus_pos is not None else 0)
-            step = {",": -50, ".": 50, "<": -500, ">": 500}[key]
+            step = {"n": -2, "m": 2, ",": -50, ".": 50,
+                    "<": -500, ">": 500}[key]
             new = max(-32768, min(32767, base + step))
             if new != focus_target:
                 focus_target = new
@@ -681,6 +770,8 @@ def run_idle(sess: BodySession, duration: float,
         if want_feedback:
             requests.append(IRIS_FEEDBACK)
             want_feedback = False
+        if focus_poll_left:
+            requests.append(FOCUS_POS_POLL)
         issued: set[bytes] = set(requests)
         hit_magic = False
         quads = 0
@@ -725,6 +816,17 @@ def run_idle(sess: BodySession, duration: float,
                         issued.add(r)
                         requests.append(r)
 
+        if focus_poll_left and not pending_focus:
+            focus_poll_left -= 1
+            settled = (focus_pos is not None
+                       and focus_pos == focus_settle_prev)
+            if settled or focus_poll_left == 0:
+                print(f"  t={sess.now():8.3f} focus settled at "
+                      f"{focus_pos if focus_pos is not None else 'unknown'} "
+                      f"(target {focus_target})")
+                focus_poll_left = 0
+            focus_settle_prev = focus_pos
+
         if pending_iris and not hit_magic and not magic_mode:
             # control writes ride at the end of a burst, after the polls,
             # like the captured body's 0x15 drive sequences do
@@ -746,6 +848,8 @@ def run_idle(sess: BodySession, duration: float,
                   f"(from {focus_pos if focus_pos is not None else 'unknown'})")
             if command_focus(sess, focus_target, focus_pos):
                 print(f"  t={sess.now():8.3f} focus command accepted")
+                focus_poll_left = 12   # track position until it settles
+                focus_settle_prev = None
             else:
                 print(f"  t={sess.now():8.3f} focus command not acknowledged")
 
@@ -757,10 +861,27 @@ def run_idle(sess: BodySession, duration: float,
             if resync_cooldown == 0:
                 time.sleep(INTRA_BURST_GAP_S)
                 if transport_reset(sess):
-                    print(f"  t={sess.now():8.3f} transport reset complete "
-                          "— resuming polling")
-                    magic_mode = False
                     reset_fails = 0
+                    if replay is not None:
+                        # the dialogue leaves the lens in its post-reset
+                        # state awaiting init; polling it there just
+                        # re-markers it (the 402-reset loop in
+                        # failed_at_about_3min.tsv) — re-init first
+                        print(f"  t={sess.now():8.3f} transport reset "
+                              "complete — re-initializing")
+                        time.sleep(INTRA_BURST_GAP_S)
+                        if run_startup(sess, replay):
+                            magic_mode = False
+                            sess.counter = next_counter_after(replay)
+                        else:
+                            resync_cooldown = 2
+                        # run_startup reset the phase clock; realign
+                        next_burst = sess.phase_now()
+                        burst_i = 0
+                    else:
+                        print(f"  t={sess.now():8.3f} transport reset "
+                              "complete — resuming polling")
+                        magic_mode = False
                 else:
                     reset_fails += 1
                     if reset_fails <= 2 or replay is None:
@@ -828,6 +949,11 @@ def main() -> None:
     ap.add_argument("--transcript", type=Path,
                     help="write Saleae-style TSV of the session (byte-accurate "
                          "tx/rx, analyzable with fuji_spi.py)")
+    ap.add_argument("--power-gpio", type=int, default=17,
+                    help="GPIO driving the external lens-power switch "
+                         "(default 6; -1 disables). Raised before the settle "
+                         "window so power->first-packet timing is "
+                         "deterministic; keys 1/2 toggle it in-session")
     ap.add_argument("--dry-run", action="store_true",
                     help="no SPI hardware; lens responses simulated from capture")
     args = ap.parse_args()
@@ -842,7 +968,12 @@ def main() -> None:
     link = SpiLink(args.bus, args.device, args.dry_run)
     sess = BodySession(link, args.transcript)
     kb = Keyboard()
+    power = LensPower(-1 if args.dry_run else args.power_gpio)
     try:
+        if power.enabled:
+            print(f"lens power ON (GPIO{power.gpio} high); settle window "
+                  "provides the boot delay")
+            power.set(True)
         ok = run_startup_with_retry(sess, replay, args.settle,
                                     max(0, args.startup_retries),
                                     args.retry_delay,
@@ -852,11 +983,14 @@ def main() -> None:
             print("aborting before idle loop (no lens response)")
             sys.exit(1)
         sess.counter = next_counter_after(replay)
-        run_idle(sess, args.idle_seconds, replay, kb)
+        run_idle(sess, args.idle_seconds, replay, kb, power)
     except KeyboardInterrupt:
         print("\ninterrupted")
     finally:
         kb.restore()
+        if power.enabled:
+            print("lens power OFF (script exit)")
+        power.close()
         sess.close()
         if args.transcript:
             print(f"transcript written to {args.transcript}")
