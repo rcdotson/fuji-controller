@@ -1,0 +1,20 @@
+[Unit]
+Description=Fuji G-mount lens server (UART command link)
+After=multi-user.target
+
+[Service]
+Type=simple
+# The lens is left powered off until a SET POWER ON arrives, so starting
+# early is harmless.
+ExecStart=/usr/bin/python3 /home/pi/fuji-controller/software/pi/gf_server.py
+WorkingDirectory=/home/pi/fuji-controller/software/pi
+# spidev, the gpiochip and /dev/serial0 all need group membership; the pi
+# user is in spi/gpio/dialout by default. Change User= to match your login.
+User=pi
+Restart=always
+RestartSec=2
+# Unbuffered so journalctl -fu gf-server shows the protocol log live.
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
