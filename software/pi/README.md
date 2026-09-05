@@ -122,3 +122,19 @@ python3 gf_server.py --port - --dry-run --settle 0.2
 
 Speaks the protocol on stdin/stdout with the SPI link simulated from the
 capture; all diagnostics go to stderr so the command stream stays clean.
+
+
+
+### Focus Distance Model
+
+Initial estimate with some noisy data - needs further confirmation.
+
+ a lens's focus extension is f²/d, so counts should be linear in 1/d, and panel 2 shows it is:
+
+
+```
+counts(d) = -381.9 + 28426 / d        d in metres    R² = 0.957, RMSE 37 counts
+d(counts)  = 28426 / (counts + 381.9)
+```
+
+Infinity asymptote ≈ −382 counts
