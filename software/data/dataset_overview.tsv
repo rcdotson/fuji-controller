@@ -1,0 +1,18 @@
+Lens	Camera	Station		Distance_yds	Filename
+Lens1	Camera1	Station1	52	s1l1.txt
+Lens1	Camera1	Station2	117	s2l1.txt
+Lens1	Camera1	Station2	117	s2l1b.txt
+Lens1	Camera1	Station3	148	s3l1.txt
+Lens1	Camera1	Station4	361	s4l1.txt
+Lens1	Camera1	Station5	511	s5l1.txt
+Lens2	Camera2	Station1b	47	s1l2c2.txt
+Lens2	Camera2	Station2b	117	s2l2c2.txt
+Lens2	Camera2	Station3b	148	s3l2c2.txt
+Lens2	Camera2	Station3b	148	s3l2c2a.txt
+Lens2	Camera2	Station4b	359	s4l2c2_maybebad.txt
+Lens2	Camera2	Station5b	512	s5l2c2.txt
+Lens2	Camera1	Station5	511	s5l2.csv
+Lens2	Camera1	Station6	581	s6l2.csv
+
+
+

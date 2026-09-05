@@ -1,0 +1,7 @@
+file,station,distance_yd,distance_m,af_moves,af_target,feedback,counts_used
+s1l1.txt,Station1,52,47.55,0,None,236,236
+s2l1.txt,Station2,117,106.98,7,-124,-124,-124
+s2l1b.txt,Station2,117,106.98,3,-109,-109,-109
+s3l1.txt,Station3,148,135.33,1,-243,-243,-243
+s4l1.txt,Station4,361,330.10,2,-296,-296,-296
+s5l1.txt,Station5,511,467.26,3,-269,-269,-269
