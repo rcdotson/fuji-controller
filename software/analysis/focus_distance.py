@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -86,23 +87,46 @@ def load_overview(path: Path) -> list[dict]:
     return rows
 
 
+def collect_dir(folder: Path) -> list[dict]:
+    """Collect a directory of captures named '<distance>yds.txt'.
+
+    Used for datasets shot as one sweep of stations rather than registered in
+    dataset_overview.tsv.
+    """
+    recs = []
+    for path in sorted(folder.glob("*.txt")):
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*yds?", path.stem, re.IGNORECASE)
+        if not m:
+            print(f"  skipping {path.name}: no '<N>yds' distance in the filename")
+            continue
+        recs.append(_record(path, path.stem, float(m.group(1))))
+    if not recs:
+        raise SystemExit(f"no '<N>yds.txt' captures in {folder}")
+    return sorted(recs, key=lambda r: r["dist_yd"])
+
+
+def _record(path: Path, station: str, dist_yd: float) -> dict:
+    targets, feedback = focus_events(path)
+    return {
+        "file": path.name,
+        "station": station,
+        "dist_yd": dist_yd,
+        "dist_m": dist_yd * YD_TO_M,
+        "target": targets[-1][1] if targets else None,
+        "feedback": feedback[-1][1] if feedback else None,
+        "n_af": len(targets),
+        "targets": targets,
+        "fb_tail": [v for _, v in feedback[-6:]],
+    }
+
+
 def collect(lens: str, camera: str) -> list[dict]:
     recs = []
     for r in load_overview(DATA / "dataset_overview.tsv"):
         if r["Lens"] != lens or r["Camera"] != camera:
             continue
-        targets, feedback = focus_events(DATA / r["Filename"])
-        recs.append({
-            "file": r["Filename"],
-            "station": r["Station"],
-            "dist_yd": float(r["Distance_yds"]),
-            "dist_m": float(r["Distance_yds"]) * YD_TO_M,
-            "target": targets[-1][1] if targets else None,
-            "feedback": feedback[-1][1] if feedback else None,
-            "n_af": len(targets),
-            "targets": targets,
-            "fb_tail": [v for _, v in feedback[-6:]],
-        })
+        recs.append(_record(DATA / r["Filename"], r["Station"],
+                            float(r["Distance_yds"])))
     return recs
 
 
@@ -165,7 +189,7 @@ def eval_fit(key: str, coef: np.ndarray, d_m: np.ndarray) -> np.ndarray:
 # Plot
 # ---------------------------------------------------------------------------
 
-def plot(recs: list[dict], fits: dict, out: Path, lens: str, camera: str) -> None:
+def plot(recs: list[dict], fits: dict, out: Path, title: str) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -207,12 +231,21 @@ def plot(recs: list[dict], fits: dict, out: Path, lens: str, camera: str) -> Non
              label=f"a + b/d + c/d²   R²={fits['inv2']['r2']:.3f}")
     ax1.plot(d_yd, counts, "o", ms=9, color=C_DATA, mec="#fcfcfb", mew=2,
              ls="none", label="measured AF target", zorder=5)
-    # Push each label away from the fit line (sign of its residual) so it never
-    # sits on the curve; 117 yd has two captures at the same x, so stagger those.
+    # Selective direct labels: a small set can all be named, but past that the
+    # far stations bunch up on the log axis, so label only the anchors (nearest,
+    # farthest, worst residual) and let panel 3 name the rest.
+    resid = fits["inv"]["resid"]
+    if len(recs) <= 6:
+        labelled = set(range(len(recs)))
+    else:
+        labelled = {int(np.argmin(d_yd)), int(np.argmax(d_yd)),
+                    int(np.argmax(np.abs(resid)))}
     seen: dict[float, int] = {}
-    for r, res in zip(recs, fits["inv"]["resid"]):
+    for i, (r, res) in enumerate(zip(recs, resid)):
         n = seen.get(r["dist_yd"], 0)
         seen[r["dist_yd"]] = n + 1
+        if i not in labelled:
+            continue
         # leftmost point would run off the axis if labelled to its left
         right = bool(n) or r["dist_yd"] == d_yd.min()
         ha, dx = ("left", 11) if right else ("right", -11)
@@ -221,13 +254,15 @@ def plot(recs: list[dict], fits: dict, out: Path, lens: str, camera: str) -> Non
                      (r["dist_yd"], r["counts"]), textcoords="offset points",
                      xytext=(dx, dy), ha=ha, va=va, fontsize=8, color=C_TEXT2)
     ax1.set_xscale("log")
-    ax1.set_xticks([50, 75, 100, 150, 250, 400, 600])
+    ticks = [t for t in (25, 50, 75, 100, 150, 250, 400, 600)
+             if d_yd.min() * 0.9 <= t <= d_yd.max() * 1.1]
+    ax1.set_xticks(ticks)
     ax1.set_xticks([], minor=True)
     ax1.get_xaxis().set_major_formatter(matplotlib.ticker.ScalarFormatter())
     ax1.set_xlim(grid_yd[0], grid_yd[-1] * 1.05)
     ax1.set_xlabel("subject distance (yards, log scale)", color=C_TEXT2, fontsize=10)
     ax1.set_ylabel("focus position (counts)", color=C_TEXT2, fontsize=10)
-    ax1.set_title(f"{lens} ({LENS_MODEL}) / {camera} — focus counts vs distance",
+    ax1.set_title(f"{title} — focus counts vs distance",
                   color=C_TEXT, fontsize=12, loc="left", pad=12)
     ax1.legend(frameon=False, fontsize=9, labelcolor=C_TEXT2, loc="upper right")
     style(ax1)
@@ -264,8 +299,8 @@ def plot(recs: list[dict], fits: dict, out: Path, lens: str, camera: str) -> Non
     ax3.bar(idx + width / 2, fits["inv2"]["resid"], width, color=C_QUAD,
             label=f"a + b/d + c/d²  (RMSE {fits['inv2']['rmse']:.0f})")
     ax3.set_xticks(idx)
-    ax3.set_xticklabels([f"{r['dist_yd']:.0f} yd\n{r['file'].removesuffix('.txt')}"
-                         for r in recs], fontsize=8)
+    ax3.set_xticklabels([f"{r['dist_yd']:.0f} yd" for r in recs], fontsize=8,
+                        rotation=45, ha="right", rotation_mode="anchor")
     ax3.set_ylim(-tol * 1.65, tol * 1.65)
     ax3.set_ylabel("residual (counts)", color=C_TEXT2, fontsize=10)
     ax3.set_title("Fit residuals vs focus tolerance",
@@ -372,10 +407,24 @@ def compare_plot(sets: list[dict], out: Path) -> None:
 
 # ---------------------------------------------------------------------------
 
-def analyse(lens: str, camera: str, csv_out: Path | None) -> tuple[list[dict], dict]:
-    recs = collect(lens, camera)
-    if not recs:
-        raise SystemExit(f"no captures for {lens}/{camera}")
+def analyse(lens: str, camera: str, csv_out: Path | None,
+            folder: Path | None = None,
+            exclude: list[str] | None = None) -> tuple[list[dict], dict]:
+    if folder is not None:
+        recs = collect_dir(folder)
+    else:
+        recs = collect(lens, camera)
+        if not recs:
+            raise SystemExit(f"no captures for {lens}/{camera}")
+
+    for pat in exclude or []:
+        dropped = [r for r in recs if pat in r["file"]]
+        if not dropped:
+            raise SystemExit(f"--exclude {pat!r} matched no capture")
+        recs = [r for r in recs if pat not in r["file"]]
+        print(f"excluded {', '.join(r['file'] for r in dropped)}")
+    if len(recs) < 3:
+        raise SystemExit("need at least 3 captures to fit")
 
     print(f"===== {lens} / {camera} =====")
     print(f"{'file':20} {'station':10} {'yd':>5} {'m':>7} {'AF moves':>8} "
@@ -455,11 +504,26 @@ def main() -> None:
     ap.add_argument("--csv", type=Path, default=HERE / "focus_vs_distance.csv")
     ap.add_argument("--compare", action="store_true",
                     help="analyse Lens1/Camera1 and Lens2/Camera2 and overlay them")
+    ap.add_argument("--exclude", action="append", default=[], metavar="SUBSTR",
+                    help="drop captures whose filename contains SUBSTR "
+                         "(repeatable), e.g. --exclude 195yds")
+    ap.add_argument("--dir", type=Path,
+                    help="analyse a folder of '<N>yds.txt' captures instead of "
+                         "reading dataset_overview.tsv")
     args = ap.parse_args()
 
+    if args.dir:
+        label = args.dir.name
+        recs, fits = analyse(label, "(body not identified)", args.csv,
+                             folder=args.dir, exclude=args.exclude)
+        plot(recs, fits, args.plot, f"{label} — {len(recs)} stations")
+        return
+
     if not args.compare:
-        recs, fits = analyse(args.lens, args.camera, args.csv)
-        plot(recs, fits, args.plot, args.lens, args.camera)
+        recs, fits = analyse(args.lens, args.camera, args.csv,
+                             exclude=args.exclude)
+        plot(recs, fits, args.plot,
+             f"{args.lens} ({LENS_MODEL}) / {args.camera}")
         return
 
     sets = []
@@ -468,7 +532,8 @@ def main() -> None:
             ("Lens2", "Camera2", C_INV, "Lens2 / Camera2 (GFX50S II)")):
         suffix = f"{lens}_{camera}".lower()
         recs, fits = analyse(lens, camera, HERE / f"focus_vs_distance_{suffix}.csv")
-        plot(recs, fits, HERE / f"focus_vs_distance_{suffix}.png", lens, camera)
+        plot(recs, fits, HERE / f"focus_vs_distance_{suffix}.png",
+             f"{lens} ({LENS_MODEL}) / {camera}")
         sets.append({"recs": recs, "fits": fits, "color": color, "label": label})
         print()
 

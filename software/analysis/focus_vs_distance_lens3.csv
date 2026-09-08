@@ -1,0 +1,10 @@
+file,station,distance_yd,distance_m,af_moves,af_target,feedback,counts_used
+25yds.txt,25yds,25,22.86,5,1264,1265,1264
+47yds.txt,47yds,47,42.98,6,674,674,674
+79yds.txt,79yds,79,72.24,5,356,356,356
+107yds.txt,107yds,107,97.84,7,264,264,264
+153yds.txt,153yds,153,139.90,9,131,132,131
+259yds.txt,259yds,259,236.83,7,81,81,81
+325yds.txt,325yds,325,297.18,1,51,52,51
+387yds.txt,387yds,387,353.87,9,22,22,22
+454yds.txt,454yds,454,415.14,9,24,24,24
