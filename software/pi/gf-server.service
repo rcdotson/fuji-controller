@@ -10,7 +10,11 @@ ExecStart=/usr/bin/python3 /home/pi/fuji-controller/software/pi/gf_server.py
 WorkingDirectory=/home/pi/fuji-controller/software/pi
 # spidev, the gpiochip and /dev/serial0 all need group membership; the pi
 # user is in spi/gpio/dialout by default. Change User= to match your login.
-User=pi
+User=aware
+# SIGTERM runs the lens park sequence before the rail drops; give it room
+# (the park itself is ~250ms, --shutdown-timeout bounds the wait at 1.5s).
+KillSignal=SIGTERM
+TimeoutStopSec=15
 Restart=always
 RestartSec=2
 # Unbuffered so journalctl -fu gf-server shows the protocol log live.

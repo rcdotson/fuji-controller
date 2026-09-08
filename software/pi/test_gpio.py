@@ -13,7 +13,7 @@ Usage:
 import sys
 import time
 
-from gf_body_replay import Keyboard, LensPower
+from gf_bodygf_controller import Keyboard, LensPower
 
 
 def main() -> None:

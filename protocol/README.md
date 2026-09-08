@@ -70,15 +70,15 @@ The total group of unique command bytes observed is below, entries with listed C
 | `0x07` |              | Not documented/decoded                       |
 | `0x08` | `0x88`       | Aperture/Focus and lens state feedback       |
 | `0x09` | `0x89`       | Longer lens status bursts, not understood    |
-| `0x10` | `0x90`       | Not documented/decoded                       |
+| `0x10` | `0x90`       | Park/shutdown, see Shutdown Sequence         |
 | `0x0c` | `0x8c`       | Aperture/focus control ring, mostly decoded. |
-| `0x0f` | `0x8f`       | Not decoded                                  |
+| `0x0f` | `0x8f`       | Opens a state readout block, not decoded     |
 | `0x15` | `0x95`       | Focus motor, mostly decoded                  |
 | `0x16` | `0x96`       | Not documented/decoded                       |
 | `0x18` | `0x98`       | Aperture setpoint, mostly decoded            |
-| `0x20` | `0xa0`       | OIS. Not documented/decoded                  |
+| `0x20` | `0xa0`       | OIS/actuator enable (1 = on, 0 = off)        |
 | `0x25` |              | Not documented/decoded                       |
-| `0x28` | `0xa8`       | Not documented/decoded                       |
+| `0x28` | `0xa8`       | Channel select for a staged write            |
 | `0x2a` | `0xaa`       | Not documented/decoded                       |
 | `0x32` |              | Not documented/decoded                       |
 | `0x3c` |              | Not documented/decoded                       |
@@ -208,6 +208,32 @@ The low seven bits of payload `b1` appear to identify pending follow-up requests
 
 `b1 bit7` might be a scheduler or response-phase marker. It not clear if it's a  dirty/valid/busy bit yet. ACK `0x88` tag-0 packets are transport acknowledgements and should be excluded ignored as part of the lens-state polling.
 
+### Switch-position bits (GF250, controlled captures)
+
+Three sessions in `software/data/`, same lens and same Pi body, one physical switch changed at a time. Because only one variable moves between each pair, the bits below are attributable rather than inferred.
+
+| Capture | OIS switch | AF range switch | status `b0` | status `b1` | `0x09` tag2=2 |
+| --- | --- | --- | --- | --- | --- |
+| `startup_shutdown.txt` | on | 5m–∞ | `01`/`11` | `c0`/`c1`/`c2`/`c3` | `00 16` |
+| `startup_shutdown_no_ois.txt` | off | 5m–∞ | `01`/`11` | `80`/`81`/`82`/`83` | `00 17` |
+| `startup_shutdown_focus_full_range.txt` | off | full | `00`/`10` | `80`/`81`/`82`/`83` | `00 17` |
+
+- **`b0` bit 0 = AF range limiter engaged.** Set in all 171 status packets of the two 5m–∞ sessions, clear in all 84 of the full-range one. The body sends *nothing* in response: the request vocabulary across the two OIS-off captures is byte-identical, so the switch is purely a lens-to-body report. Contrast the OIS switch, which the body echoes back with `0x20`.
+- **`b1` bit 6 = OIS switch on**, and **`0x09` tag2=2 bit 0 = OIS off** — the lens reports the OIS state twice, in two unrelated packets. Neither moves with the AF range switch. (This does not explain the `00 18` seen in an earlier GF250 session; only the `16`↔`17` pair is controlled.)
+
+### `b0` bit 4 — a second pending flag
+
+Distinct from the `b1` bit-3 focus-ring flag, and it asks for a different readout:
+
+| Flag | Body's follow-up | Occurrences |
+| --- | --- | --- |
+| `b1` bit 3 | `00 00 0c b2` (tag2=2, signed ring delta) | 44 in `focus_ring_back_forth.txt`, where the ring was deliberately turned; `b0` bit 4 clear for all of them |
+| `b0` bit 4 | `00 00 0c 72` (tag2=1) | 20 across the three startup/shutdown sessions, where the rings were untouched; `b1` bit 3 clear for all but one |
+
+The tag2=1 payloads are `00 40`, `00 41`, `00 42`, `00 43`, `00 44`, `00 48`, `00 4c` — a small field with bit 6 set, unlike the signed deltas the ring channels return. Frequently followed by the body writing a `0x60` block. Not decoded, and `gf_controller.py` does not issue this poll, so whatever the lens reports here is currently ignored.
+
+> TODO: a capture that toggles one lens control at a time while watching the `0c` tag2=1 value would likely settle this.
+
 On every third burst, we have 2 additional transactions for a 6 transaction 'group'. This happens every 120ms.
 
 ![idle-burst-6](./images/idle-burst-6.png)
@@ -241,6 +267,8 @@ The payload value seems relatively stable/constant across most captures, when it
 > TODO: Work out what this actually represents?
 
 > Update (2026-08, GF250 + Pi body emulation): the payload sat at a constant `00 18` through a full 15s session, completely unchanged by focus-ring rotation in either direction. A rotation-rate interpretation therefore looks doubtful for the GF250 — possibly a per-model constant or configuration/state value.
+
+> Update (2026-09, GF250 switch-controlled captures): **bit 0 tracks the OIS switch.** `00 16` with OIS on, `00 17` with it off, across 28 and 29 samples of otherwise identical sessions — and unchanged by the AF range switch. That supports the "configuration/state value" reading over a rate. It does not account for the `00 18` above, so the upper bits presumably carry more state that was different in that session.
 
 
 ## Transport Framing & Error Recovery
@@ -1078,6 +1106,92 @@ An example slice of larger transfers:
 | 15 | 2051 | `0000 .. c8` | `0001 .. 5a` | 105632.36 | `00 00 0a 00 00 56 01 ac 02 02 04 58 05 ad 06 03 08 59 09 af 0a be 0a f0 0a 00 03 c4 09 f4 01 01 ...` | `00 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00` ... |
 | 16 | 2051 | `0001 .. 29` | `0002 .. 5a` | 3057.63 | `00 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ...` | `00 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ...` |
 | 17 | 2051 | `0002 .. 69` | `0003 .. 5a` | 144296.64 | `00 02 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ...` | `00 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00` ... |
+
+## Channel Select `0x28`
+
+Every staged control write in `software/data/startup_shutdown.txt` is preceded by a `0x28` packet whose payload selects which subsystem the staged command that follows addresses. The `0x28`, the payload command and the `0x3f` execute are latched together as one sequence.
+
+| Payload  | tag2 | Followed by                | Where                        |
+| -------- | ---- | -------------------------- | ---------------------------- |
+| `0x8001` | 0    | `0x10` park                | shutdown, t=4.9732           |
+| `0x8002` | 0    | `0x15` focus drive         | startup focus init, t=1.9634 |
+| `0x8004` | 1    | `0x18` aperture setpoint   | iris move, t=2.2674          |
+| `0x8020` | 0    | session reset              | transport resync dialogue    |
+
+Note `tag2` is not constant across channels.
+
+Our own `command_focus` / `command_iris` omit the channel select and are still accepted by a GF250, so it is evidently optional for those two — but the body always sends it.
+
+## Shutdown Sequence
+
+Captured in `software/data/startup_shutdown.txt` (GF250, t=4.958 to 5.203). The body does not simply cut power; it turns OIS off, asks the lens to park, waits for it to finish, and snapshots the final state.
+
+`software/data/startup_shutdown_no_ois.txt` is the same lens and body with the OIS switch off. The shutdown there is byte-identical apart from the rolling transport counters, and takes the same 226 ms from park execute to final readout — so nothing below depends on OIS.
+
+### A — OIS off (t=4.9588)
+
+`0x20` with payload `0x0000`, latched with the execute.
+
+```
+tx 00 00 20 04     staged: actuators off
+tx 08 10 80 22     transport(8)
+tx 00 00 3f c6     execute
+tx 09 00 a0 1e     ack of the 0x20 echo
+tx 00 00 00 00
+tx 08 00 bf d8     ACK_BF
+```
+
+`0x20` carries the **OIS state**, not a general actuator enable. `software/data/startup_shutdown_no_ois.txt` is the same GF250 on the same body with the OIS switch flipped off, and it is the *only* packet in the whole session that differs: payload `0x0001` at t=2.0624 with the switch on, payload `0x0000` at t=1.5544 with it off, at the same point in startup and framed identically. The GF45 `power_on.txt` likewise sends payload 0 — it has no OIS.
+
+Shutdown sends payload 0 either way, so phase A is "OIS off", which is a sensible thing to do before asking the lens to retract.
+
+A body implementation must therefore mirror the lens's own switch rather than choosing a payload: sending `0x0001` to a lens whose switch is off would override the user's switch.
+
+### B — park (t=4.9706, 12 ms later)
+
+A `0x0f` latch and a `0x09` sub-read, then channel `0x8001` and the `0x10` park latched together. `0x10` payload `0x0001` appears nowhere else in either capture.
+
+```
+tx 00 00 0f c0     latch
+tx 00 01 09 04     0x09 sub-read
+---
+tx 80 01 28 24     staged: channel select 0x8001
+tx 0c 10 80 02     transport(0x0c)
+tx 00 01 10 22     staged: park
+tx 0d 00 a8 1e     ack of the 0x28 echo
+tx 00 00 3f c6     execute
+tx 0e 00 90 04     ack of the 0x10 echo
+tx 00 00 00 00
+tx 08 00 bf d8     ACK_BF
+```
+
+### C — wait for the park (t=4.98 to 5.10)
+
+The park is asynchronous. Normal 40 ms status bursts continue and the status `b1` byte walks `c0 → c3 → c3 → c3 → c1`. With the OIS switch off the identical walk reads `80 → 83 → 83 → 81`, which is what pins bit 6:
+
+| `b1` bit | meaning                | evidence                                                                                                                       |
+| -------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `0x01`   | actuators not ready    | set through the lens's boot, clear once running, set again after the park — but it also flickers during startup config, so it is advisory |
+| `0x02`   | busy, actuating        | set during the iris move at t=2.30; set for 129 ms during the park (117 ms in the no-OIS capture)                                |
+| `0x40`   | OIS switch on          | set in *every* status packet of the OIS-on capture and clear in *every* packet of the no-OIS one — same lens and body, including the first packet after boot, before the body has sent anything. Clear on a GF45. |
+
+The completion signal is `b1 & 0x02` clearing — 129 ms after the execute here, 117 ms with OIS off. The body then polls two or three more times before moving on.
+
+### D — final state readout (t=5.1996)
+
+Five requests, byte-identical to the block the body runs after identification at t=1.9593 — a state snapshot on the way in and on the way out.
+
+```
+tx 00 00 0f c0     latch
+tx 00 01 09 04     0x09 sub-read
+tx 00 01 08 42     focus position   ->  rx f7 4c 08 64   (-2228)
+tx 00 01 08 82     iris state       ->  rx 00 00 08 a2   (index 0)
+tx 00 00 09 e8     0x09 tag-3 read  ->  rx 00 01 09 c8
+```
+
+Power is removed immediately after the last ack. Note the lens is *not* driven to a mechanical stop first — focus stayed wherever the user left it, so whatever retraction happens is the lens's own doing, triggered by the `0x10`.
+
+Implemented in `software/pi/gf_controller.py` as `run_shutdown()`, with the packet builders checked against these bytes by `software/pi/test_sequences.py`.
 
 ## Unknown Commands
 

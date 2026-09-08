@@ -18,6 +18,12 @@ has lost transport sync and wants the reset dialogue (counterpart marker,
 transport_reset); if the marker persists after that, the startup prefix is
 re-run as escalation.
 
+Phase 3 (shutdown): replays the body's power-off sequence, captured in
+startup_shutdown.txt (t=4.958-5.203) — OIS off (0x20 payload 0), park via
+0x28 channel 0x8001 + 0x10, wait for the status busy bit to clear (~129ms),
+then read the final focus/iris back before power is cut. It runs on exit and
+on the `2` key, so the lens is never simply de-energized mid-motion.
+
 Wiring (lens pad numbering per fuji-G-mount/electrical/README.md; all logic 3.3V):
 
     Lens Pin 5/6  -> Pi GND            (also common with bench supply grounds)
@@ -41,7 +47,8 @@ During the idle session (tty only), keys drive the lens:
     focus: `m`/`n` step the motor +/-2 counts, `.`/`,` +/-50, `>`/`<` +/-500
     power: `1` lens power on, `2` off (GPIO6 -> external high-side switch;
            raised automatically before the settle window at startup, driven
-           low again when the script exits)
+           low again when the script exits). `2` and script exit both park
+           the lens first — see Phase 3.
     `q` quits
 Iris setpoints are staged with 0x18 and latched with the 3f execute, each
 followed by a feedback poll (00 01 08 82) reading back the landed index.
@@ -106,6 +113,41 @@ FOCUS_POS_POLL = pkt(0x00, 0x01, 0x08, tag2=1)  # 00 01 08 42: focus position
 SYNC_EXECUTE = pkt(0x00, 0x00, 0x3F, tag2=3)   # 00 00 3f c6: execute/latch
 ACK_BF = pkt(0x08, 0x00, 0xBF, tag2=3)         # 08 00 bf d8
 
+# --- power-down vocabulary (ground truth: startup_shutdown.txt) -------------
+# The body's shutdown is four phases: OIS off (0x20 payload 0), the park
+# command on channel 0x8001, a wait for the status busy bit to clear, then a
+# state snapshot before power is cut.
+#
+# 0x20 carries the OIS state, not a general actuator enable: the same GF250
+# with its OIS switch flipped sends payload 1 (startup_shutdown.txt t=2.0624)
+# vs payload 0 (startup_shutdown_no_ois.txt t=1.5544) at the same point in
+# startup, tracking the b1 bit-6 the lens reports. Shutdown sends payload 0
+# either way.
+OIS_ON = pkt(0x00, 0x01, 0x20)                 # 00 01 20 24
+OIS_OFF = pkt(0x00, 0x00, 0x20)                # 00 00 20 04
+PARK = pkt(0x00, 0x01, 0x10)                   # 00 01 10 22: park/shutdown
+STATE_LATCH = pkt(0x00, 0x00, 0x0F, tag2=3)    # 00 00 0f c0: opens a readout
+POLL_09_SUB = pkt(0x00, 0x01, 0x09)            # 00 01 09 04: 0x09 sub-read
+POLL_09_T3 = pkt(0x00, 0x00, 0x09, tag2=3)     # 00 00 09 e8: 0x09 tag-3 read
+
+# The five-request block the body runs both after identification (t=1.959 in
+# startup_shutdown.txt) and immediately before cutting power (t=5.200) — a
+# state snapshot on the way in and on the way out, byte-identical both times.
+STATE_READOUT = [STATE_LATCH, POLL_09_SUB, FOCUS_POS_POLL, IRIS_FEEDBACK,
+                 POLL_09_T3]
+
+
+def channel(n: int, tag2: int = 0) -> bytes:
+    """0x28 channel selector: the payload picks which subsystem the staged
+    command that follows addresses. Observed: 0x8001 park (shutdown,
+    tag2=0), 0x8002 focus motor (tag2=0, precedes a 0x15 drive), 0x8004 iris
+    (tag2=1, precedes a 0x18 setpoint), 0x8020 transport reset. tag2 is not
+    constant across channels, so pass it explicitly outside the park path."""
+    return pkt(0x80, n, 0x28, tag2=tag2)
+
+
+PARK_CHANNEL = 0x01
+
 
 def iris_setpoint(index: int) -> bytes:
     """0x18 staged iris setpoint: index 1 (wide open) .. 22 (fully closed),
@@ -140,6 +182,18 @@ def ack_for(rx: bytes) -> bytes:
     tag2 of the packet being acknowledged (lens 0x08/tag2=0 -> 08 00 88 32;
     the 0x09 idle response is tag2=2, so its ACK is 08 00 89 b8)."""
     return pkt(0x08, 0x00, 0x80 | (rx[2] & 0x7F), tag2=rx[3] >> 6)
+
+
+def ack_staged(n: int, staged: bytes) -> bytes:
+    """ACK of a staged command's echo, inside a drive sequence.
+
+    Same cmd|0x80 / matching-tag2 rule as ack_for, but b0 carries the rolling
+    transport counter instead of the fixed 0x08 (the counter-carrying ACK
+    path). Reproduces every observed sequence ACK: 0d 00 a8 1e for the
+    80 01 28 24 channel select, 0e 00 90 04 for the 00 01 10 22 park,
+    09 00 a0 1e for the 00 00 20 04 disable, and the 0x95/0x98 forms the
+    focus and iris sequences already used."""
+    return pkt(n, 0x00, 0x80 | (staged[2] & 0x7F), tag2=staged[3] >> 6)
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +533,58 @@ def run_startup_with_retry(sess: BodySession, replay: list[dict], settle: float,
 # Phase 2: synthesized idle loop
 # ---------------------------------------------------------------------------
 
+def is_status(rx: bytes) -> bool:
+    """True for a lens tag-0 0x08 status response (not an ack)."""
+    return (len(rx) == 4 and (rx[2] & 0x7F) == 0x08 and not (rx[2] & 0x80)
+            and (rx[3] >> 6) == 0)
+
+
+def status_busy(rx: bytes) -> bool:
+    """b1 bit 1: an actuator is moving. Set during the iris move at t=2.30
+    and for the 129ms the park takes at t=4.98 in startup_shutdown.txt."""
+    return bool(rx[1] & 0x02)
+
+
+def status_disabled(rx: bytes) -> bool:
+    """b1 bit 0: actuators not ready. Set through the lens's boot, clear once
+    it is running, and set again after the park — but it also flickers during
+    the startup config block (startup_shutdown_no_ois.txt t=1.49-1.57), so
+    treat it as advisory rather than a clean latch."""
+    return bool(rx[1] & 0x01)
+
+
+def af_range_limited(rx: bytes) -> bool:
+    """b0 bit 0: the AF range switch is at 5m-infinity rather than full.
+
+    Set in all 171 status packets of the two 5m-infinity captures and clear
+    in all 84 of startup_shutdown_focus_full_range.txt — same lens and body,
+    switch flipped. The body sends nothing in response to it: the request
+    vocabulary is identical across those captures, so this is purely a
+    lens-to-body report."""
+    return bool(rx[0] & 0x01)
+
+
+def detail_pending(rx: bytes) -> bool:
+    """b0 bit 4: a lens-detail readout is waiting on 0x0c tag2=1.
+
+    Distinct from the b1 bit-3 focus-ring flag: across the three
+    startup/shutdown captures this bit is set 20 times and the body answers
+    each with 00 00 0c 72, while focus_ring_back_forth.txt's 44 ring events
+    set b1 bit 3 with this bit clear. The tag2=1 payload (0x0040-0x004c) is
+    not decoded and this engine does not issue the poll."""
+    return bool(rx[0] & 0x10)
+
+
+def ois_active(rx: bytes) -> bool:
+    """b1 bit 6: the lens's OIS switch is on.
+
+    Set in every status packet of startup_shutdown.txt and clear in every one
+    of startup_shutdown_no_ois.txt — same lens and body, switch flipped —
+    including the first packet after boot, before the body has sent anything.
+    Clear on a GF45, which has no OIS at all."""
+    return bool(rx[1] & 0x40)
+
+
 def describe_status(rx: bytes) -> str | None:
     """Decode a lens tag-0 0x08 status response (non-ack)."""
     if len(rx) != 4 or (rx[2] & 0x7F) != 0x08 or (rx[2] & 0x80):
@@ -490,7 +596,15 @@ def describe_status(rx: bytes) -> str | None:
     if pend & 0x10:
         names.append("aperture-ring")
     if pend & 0x02:
-        names.append("detail/actuation")
+        names.append("busy")
+    if pend & 0x01:
+        names.append("not-ready")
+    if rx[1] & 0x40:
+        names.append("ois")
+    if rx[0] & 0x10:
+        names.append("detail")
+    if rx[0] & 0x01:
+        names.append("af-limit")
     return f"b0={rx[0]:02x} b1={rx[1]:02x} pending={'+'.join(names) or 'none'}"
 
 
@@ -573,25 +687,51 @@ def run_sequence(sess: BodySession, seq: list[bytes]) -> list[bytes] | None:
     return responses
 
 
+def staged_sequence(sess: BodySession, stages: list[bytes]) -> list[bytes]:
+    """Build the body's staged-command sequence for any number of stages.
+
+    Every control write in the captures — iris, focus, the 0x20 enable and
+    the 0x28+0x10 park — is the same template: the stages go out on the even
+    slots, one transport frame follows the first stage, and each stage's ACK
+    lands two slots after it, so the ACKs trail the stages by one. The 3f
+    execute occupies the slot after the last stage, and the sequence closes
+    on an idle and the bf execute-ack:
+
+        stage0, transport(n), stage1, ack(stage0), ... ,
+        execute, ack(stage_last), idle, ACK_BF
+
+    Verified slot-for-slot against startup_shutdown.txt: 6 slots for the
+    one-stage 0x20 disable (t=4.9588), 8 for the two-stage park (t=4.9732),
+    and it reproduces the 6-slot iris and 10-slot focus sequences this file
+    previously spelled out by hand.
+    """
+    seq = [stages[0], transport(sess.next_counter())]
+    for i in range(1, len(stages)):
+        seq.append(stages[i])
+        seq.append(ack_staged(sess.next_counter(), stages[i - 1]))
+    seq.append(SYNC_EXECUTE)
+    seq.append(ack_staged(sess.next_counter(), stages[-1]))
+    seq.extend([IDLE_PKT, ACK_BF])
+    return seq
+
+
+def staged_command(sess: BodySession, stages: list[bytes]) -> bool:
+    """Run a staged command sequence. True when the lens echoed one of the
+    staged packets or the execute — its documented accept signals."""
+    responses = run_sequence(sess, staged_sequence(sess, stages))
+    if responses is None:
+        return False
+    return any(rx in stages or (valid_pkt(rx) and (rx[2] & 0x7F) == 0x3F)
+               for rx in responses)
+
+
 def command_iris(sess: BodySession, index: int) -> bool:
     """Stage and latch an iris setpoint (first proven control write).
 
-    Sequence synthesized from the README's Aperture Drive notes and the
-    captured 0x15 motor-drive pattern: stage the 0x18 setpoint, frame it
-    with a transport packet, latch with the 3f execute, ack via the
-    counter-carrying 0x98 path, and close on the lens's bf execute-response
-    and 3f echo. Returns True when the lens echoed the staged command or
-    the execute (its documented accept signals)."""
-    staged = iris_setpoint(index)
-    n = sess.next_counter(), sess.next_counter()
-    seq = [staged, transport(n[0]), SYNC_EXECUTE,
-           pkt(n[1], 0x00, 0x98, tag2=2), IDLE_PKT, ACK_BF]
-    responses = run_sequence(sess, seq)
-    if responses is None:
-        return False
-    return any(rx == staged or rx == SYNC_EXECUTE
-               or (valid_pkt(rx) and (rx[2] & 0x7F) == 0x3F)
-               for rx in responses)
+    Sequence per the README's Aperture Drive notes and the captured 0x15
+    motor-drive pattern: stage the 0x18 setpoint and latch it with the 3f
+    execute, acked via the counter-carrying 0x98 path."""
+    return staged_command(sess, [iris_setpoint(index)])
 
 
 FOCUS_SPEED_288 = pkt(0x01, 0x20, 0x15, tag2=1)  # 01 20 15 40: manual speed
@@ -601,27 +741,204 @@ def command_focus(sess: BodySession, target: int,
                   prev: int | None) -> bool:
     """Drive the focus motor to an absolute position (signed 16-bit counts).
 
-    Exact 10-slot sequence from the manual-focus bursts in
-    focus_ring_back_forth.txt: tag0 envelope (move budget ~= 2500 + 2.2 x
-    |travel|, fitted from 44 captured sequences), transport frame, tag1
-    speed (288, the manual-focus constant), counter-carrying 0x95 acks for
-    each stage, tag2 target, the 3f execute, and the bf close."""
+    Three stages, from the manual-focus bursts in focus_ring_back_forth.txt:
+    tag0 envelope (move budget ~= 2500 + 2.2 x |travel|, fitted from 44
+    captured sequences), tag1 speed (288, the manual-focus constant), and the
+    tag2 absolute target."""
     delta = abs(target - prev) if prev is not None else 0
     env = min(20000, 2500 + (delta * 11) // 5)
     tb = target.to_bytes(2, "big", signed=True)
     envelope = pkt(env >> 8, env & 0xFF, 0x15)
     staged = pkt(tb[0], tb[1], 0x15, tag2=2)
-    seq = [envelope, transport(sess.next_counter()),
-           FOCUS_SPEED_288, pkt(sess.next_counter(), 0x00, 0x95),
-           staged, pkt(sess.next_counter(), 0x00, 0x95, tag2=1),
-           SYNC_EXECUTE, pkt(sess.next_counter(), 0x00, 0x95, tag2=2),
-           IDLE_PKT, ACK_BF]
-    responses = run_sequence(sess, seq)
-    if responses is None:
-        return False
-    return any(rx in (envelope, FOCUS_SPEED_288, staged)
-               or (valid_pkt(rx) and (rx[2] & 0x7F) == 0x3F)
-               for rx in responses)
+    return staged_command(sess, [envelope, FOCUS_SPEED_288, staged])
+
+
+# ---------------------------------------------------------------------------
+# Enable / shutdown (mirrors the body's power-on and power-off sequences)
+# ---------------------------------------------------------------------------
+
+def request_quad(sess: BodySession, req: bytes) -> tuple[bytes | None, bool]:
+    """Issue one request quad and return (payload, hit_marker).
+
+    The standalone form of the quad run_idle builds inline: request,
+    transport frame, idle, ack of whatever came back. payload is the lens's
+    non-ack response, or None if it only acked."""
+    payload = None
+    plan: list[bytes | None] = [req, transport(sess.next_counter()),
+                                IDLE_PKT, None]
+    retries = 0
+    j = 0
+    while j < len(plan):
+        tx = plan[j]
+        if tx is None:
+            tx = ack_for(payload) if payload else IDLE_PKT
+        time.sleep(INTRA_BURST_GAP_S)
+        rx = sess.xfer(tx)
+        if rx == MAGIC_WORD:
+            return None, True
+        if valid_pkt(rx) and any(rx):
+            if rx[2] & 0x80:
+                if rx[1] & 0x10 and retries < 8:
+                    retries += 1   # busy: repeat the same packet
+                    continue
+            else:
+                payload = rx
+        j += 1
+    return payload, False
+
+
+def sync_ois(sess: BodySession) -> str:
+    """Send the 0x20 the body sends after identification, matching the lens.
+
+    The payload is not ours to choose: it mirrors the OIS switch the lens
+    reports in status b1 bit 6 (payload 1 with the switch on, 0 with it off —
+    the only packet that differs between startup_shutdown.txt and
+    startup_shutdown_no_ois.txt). Sending payload 1 to a lens whose switch is
+    off would be the body overriding the user's switch, so the status is read
+    first and nothing is sent if it cannot be read.
+
+    Returns 'on', 'off', 'rejected' or 'unknown'."""
+    payload, magic = request_quad(sess, STATUS_POLL)
+    if magic or payload is None or not is_status(payload):
+        return "unknown"
+    on = ois_active(payload)
+    if not staged_command(sess, [OIS_ON if on else OIS_OFF]):
+        return "rejected"
+    return "on" if on else "off"
+
+
+def read_lens_state(sess: BodySession) -> dict:
+    """Run the body's five-request state readout (STATE_READOUT).
+
+    Returns {'focus': int|None, 'iris': int|None, 'reachable': bool}. Issued
+    as five quads rather than the body's tighter pipelined form; the
+    request/response pairs are identical on the wire."""
+    out: dict = {"focus": None, "iris": None, "reachable": True}
+    for req in STATE_READOUT:
+        payload, magic = request_quad(sess, req)
+        if magic:
+            out["reachable"] = False
+            return out
+        if payload is None or (payload[2] & 0x7F) != 0x08:
+            continue
+        tag = payload[3] >> 6
+        if tag == 1:
+            pos = int.from_bytes(payload[:2], "big", signed=True)
+            if pos != 32767:      # encoder out-of-range sentinel
+                out["focus"] = pos
+        elif tag == 2:
+            out["iris"] = payload[0] & 0x1F
+    return out
+
+
+def run_shutdown(sess: BodySession, timeout: float = 1.5,
+                 grace_bursts: int = 2, on_poll=None) -> dict:
+    """Shut the lens down the way the body does, before power is removed.
+
+    Replays the four phases captured in startup_shutdown.txt t=4.958-5.203:
+
+      A  0x20 payload 0 + execute        disable the actuators   (t=4.9588)
+      B  0x0f latch, 0x09 sub-read, then
+         0x28 channel 0x8001 + 0x10 payload 1 + execute   park   (t=4.9706)
+      C  poll status at the burst period until the b1 busy bit clears
+         (129ms in the capture), then grace_bursts more            (t=4.98+)
+      D  the five-request state readout, so the parked focus and iris
+         positions are known before the rail drops               (t=5.1996)
+
+    on_poll, if given, is called once per phase-C status poll; returning True
+    abandons the wait (the caller wants to cut power now).
+
+    Returns {'status': 'ok'|'timeout'|'rejected'|'unreachable'|'aborted',
+             'focus': int|None, 'iris': int|None, 'wait_s': float}.
+    The caller must cut power afterwards whatever the status says — a failed
+    dialogue is a reason to log, not a reason to leave the lens energized."""
+    result: dict = {"status": "ok", "focus": None, "iris": None,
+                    "wait_s": 0.0}
+
+    def unreachable() -> dict:
+        result["status"] = "unreachable"
+        print(f"  t={sess.now():8.3f} shutdown: lens stopped answering — "
+              "cutting power without finishing the sequence")
+        return result
+
+    print(f"  t={sess.now():8.3f} shutdown: OIS off")
+    if not staged_command(sess, [OIS_OFF]):
+        # the park is what protects the mechanism, so press on regardless
+        print(f"  t={sess.now():8.3f} shutdown: disable not acknowledged "
+              "— continuing to the park")
+
+    time.sleep(INTRA_BURST_GAP_S)
+    for req in (STATE_LATCH, POLL_09_SUB):
+        _, magic = request_quad(sess, req)
+        if magic:
+            return unreachable()
+    print(f"  t={sess.now():8.3f} shutdown: parking (0x28 channel "
+          f"{PARK_CHANNEL:#04x} + 0x10)")
+    if not staged_command(sess, [channel(PARK_CHANNEL), PARK]):
+        # nothing to wait for: skip phase C rather than burn the timeout,
+        # but still read the state back before the rail drops
+        result["status"] = "rejected"
+        print(f"  t={sess.now():8.3f} shutdown: park not acknowledged")
+        state = read_lens_state(sess)
+        if not state["reachable"]:
+            return unreachable()
+        result["focus"], result["iris"] = state["focus"], state["iris"]
+        return result
+
+    # Phase C: the park is asynchronous — the lens raises the busy bit and
+    # drops it when it has finished retracting.
+    t_park = time.perf_counter()
+    deadline = t_park + timeout
+    next_poll = t_park
+    saw_busy = False
+    parked = False
+    polls = 0
+    while time.perf_counter() < deadline:
+        next_poll += IDLE_PERIOD_S
+        dt = next_poll - time.perf_counter()
+        if dt > 0:
+            time.sleep(dt)
+        if on_poll is not None and on_poll():
+            result["status"] = "aborted"
+            result["wait_s"] = time.perf_counter() - t_park
+            return result
+        payload, magic = request_quad(sess, STATUS_POLL)
+        polls += 1
+        if magic:
+            return unreachable()
+        if payload is None or not is_status(payload):
+            continue
+        if status_busy(payload):
+            saw_busy = True
+        elif saw_busy or polls >= 5:
+            # busy cleared, or the lens never raised it (nothing to retract)
+            parked = True
+            break
+    result["wait_s"] = time.perf_counter() - t_park
+    if parked:
+        print(f"  t={sess.now():8.3f} shutdown: parked after "
+              f"{result['wait_s'] * 1000:.0f}ms ({polls} polls)")
+    else:
+        result["status"] = "timeout"
+        print(f"  t={sess.now():8.3f} shutdown: WARNING park did not "
+              f"complete within {timeout:.1f}s — reading out anyway")
+
+    for _ in range(max(0, grace_bursts)):
+        next_poll += IDLE_PERIOD_S
+        dt = next_poll - time.perf_counter()
+        if dt > 0:
+            time.sleep(dt)
+        _, magic = request_quad(sess, STATUS_POLL)
+        if magic:
+            return unreachable()
+
+    state = read_lens_state(sess)
+    if not state["reachable"]:
+        return unreachable()
+    result["focus"], result["iris"] = state["focus"], state["iris"]
+    print(f"  t={sess.now():8.3f} shutdown: final state focus="
+          f"{result['focus']} iris={result['iris']} — safe to cut power")
+    return result
 
 
 def run_idle(sess: BodySession, duration: float,
@@ -737,6 +1054,9 @@ def run_idle(sess: BodySession, duration: float,
         if key in ("1", "2"):
             if power and power.enabled:
                 on = key == "1"
+                if not on and not magic_mode:
+                    # park the lens before the rail drops, as the body does
+                    run_shutdown(sess)
                 power.set(on)
                 print(f"  t={sess.now():8.3f} lens power "
                       f"{'ON' if on else 'OFF'} (GPIO{power.gpio})")
@@ -940,10 +1260,10 @@ def main() -> None:
                     help="substring a real identification must contain (e.g. "
                          "LR107A), rejecting bootloader-beacon garbage that "
                          "decodes as an ident (default: check disabled)")
-    ap.add_argument("--replay-end", type=int, default=64,
-                    help="replay only the first N captured transactions — the "
+    ap.add_argument("--replay-end", type=int, default=20,
+                    help="replay only the first N captured transactions from startup_replay.json — the "
                          "capture's tail is state-dependent idle traffic that "
-                         "desyncs a live lens (default 64, the end of the "
+                         "desyncs a live lens (default 20, the end of the "
                          "deterministic config prefix; 0 = full capture)")
     ap.add_argument("--idle-seconds", type=float, default=10.0)
     ap.add_argument("--transcript", type=Path,
@@ -954,6 +1274,13 @@ def main() -> None:
                          "(default 6; -1 disables). Raised before the settle "
                          "window so power->first-packet timing is "
                          "deterministic; keys 1/2 toggle it in-session")
+    ap.add_argument("--no-ois-sync", action="store_true",
+                    help="skip the 0x20 OIS-state packet the body sends after "
+                         "identification (payload mirrors the lens's own OIS "
+                         "switch)")
+    ap.add_argument("--shutdown-timeout", type=float, default=1.5,
+                    help="seconds to wait for the park to complete before "
+                         "cutting power anyway (default 1.5)")
     ap.add_argument("--dry-run", action="store_true",
                     help="no SPI hardware; lens responses simulated from capture")
     args = ap.parse_args()
@@ -969,6 +1296,7 @@ def main() -> None:
     sess = BodySession(link, args.transcript)
     kb = Keyboard()
     power = LensPower(-1 if args.dry_run else args.power_gpio)
+    lens_up = False
     try:
         if power.enabled:
             print(f"lens power ON (GPIO{power.gpio} high); settle window "
@@ -983,11 +1311,23 @@ def main() -> None:
             print("aborting before idle loop (no lens response)")
             sys.exit(1)
         sess.counter = next_counter_after(replay)
+        lens_up = True
+        if not args.no_ois_sync:
+            print(f"OIS sync: {sync_ois(sess)}")
         run_idle(sess, args.idle_seconds, replay, kb, power)
     except KeyboardInterrupt:
         print("\ninterrupted")
     finally:
         kb.restore()
+        # A lens that is still energized gets the body's park sequence before
+        # the rail drops; power.state is False only if the session already
+        # cut it with the '2' key (which parks on its way down).
+        if lens_up and (power.state or not power.enabled):
+            print("shutting the lens down...")
+            try:
+                run_shutdown(sess, timeout=args.shutdown_timeout)
+            except Exception as exc:      # never block the power cut
+                print(f"  shutdown sequence failed: {exc}")
         if power.enabled:
             print("lens power OFF (script exit)")
         power.close()

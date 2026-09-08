@@ -10,6 +10,9 @@ Two programs share one protocol implementation:
   from `gf_controller.py` and drives it from an ASCII command link on
   `/dev/serial0` instead of the keyboard. **Starts with the lens powered off
   and un-initialized**; nothing is driven until a `SET POWER ON` arrives.
+- **`test_sequences.py`** — checks the packet builders against byte strings
+  lifted from the captures. Pure logic, no hardware: `python3
+  test_sequences.py`. Run it after touching anything in the packet layer.
 
 ## Serial protocol
 
@@ -19,13 +22,14 @@ insensitive, 128 characters max. Every command gets exactly one reply line.
 | Command | Reply | Notes |
 | --- | --- | --- |
 | `SET POWER ON` | `OK POWER ON` | Accepted, not complete — the rail comes up, then the startup replay runs (~2–10 s). Wait for `EVT STATE READY`. |
-| `SET POWER OFF` | `OK POWER OFF` | Cuts the rail immediately, aborting a startup in progress. Cached focus/iris feedback is discarded (the lens reboots). |
+| `SET POWER OFF` | `OK POWER OFF` | Parks the lens first — the rail drops ~250 ms later, at `EVT STATE OFF`. Cached focus/iris feedback is then discarded (the lens reboots). |
+| `SET POWER OFF FORCE` | `OK POWER OFF` | Cuts the rail immediately, no park. For a wedged lens or an urgent stop. |
 | `SET FOCUS <n>` | `OK FOCUS <n>` | Absolute motor position, signed 16-bit (−32768…32767). The move is asynchronous — track `EVT FOCUS` / `EVT FOCUS_SETTLED`. |
 | `SET IRIS <n>` | `OK IRIS <n>` | Third-stop index, 1 = wide open … 22 = fully closed. Confirmed by `EVT IRIS <n>` from the lens's own feedback poll. |
 | `GET POWER` | `OK POWER ON`\|`OFF` | `ON` from the moment the rail is raised, including while booting. |
 | `GET FOCUS` | `OK FOCUS <pos>` | Last position feedback. `ERR NO_FEEDBACK` before the first reading. |
 | `GET IRIS` | `OK IRIS <index>` | Last index feedback. `ERR NO_FEEDBACK` before the first reading. |
-| `GET STATE` | `OK STATE <name>` | `OFF`, `STARTING`, `READY` or `RESYNC`. |
+| `GET STATE` | `OK STATE <name>` | `OFF`, `STARTING`, `READY`, `RESYNC` or `STOPPING`. |
 | `PING` | `OK PONG` | |
 | `HELP` | `OK HELP ...` | One-line grammar reminder. |
 
@@ -42,8 +46,10 @@ Unsolicited events (suppress with `--no-events`):
 
 ```
 EVT READY gf-server 1.0        server booted, lens off
-EVT STATE OFF|STARTING|READY|RESYNC
+EVT STATE OFF|STARTING|READY|RESYNC|STOPPING
 EVT POWER ON|OFF
+EVT PARKED <focus> <iris>      lens parked, safe to cut the rail
+EVT OIS ON|OFF                 OIS switch position, sent back to the lens
 EVT FOCUS <pos>                position changed (commanded move or ring)
 EVT FOCUS_SETTLED <pos>        motor stopped
 EVT IRIS <index>               iris landed on a new index
@@ -79,9 +85,42 @@ queued for an unbounded time — reissue them after `EVT STATE READY`.
 <- OK FOCUS -1500
 -> SET POWER OFF
 <- OK POWER OFF
+<- EVT STATE STOPPING
+<- EVT FOCUS -1500
+<- EVT IRIS 10
+<- EVT PARKED -1500 10
 <- EVT POWER OFF
 <- EVT STATE OFF
 ```
+
+## Shutdown
+
+The lens is never simply de-energized. `SET POWER OFF`, SIGTERM and process
+exit all run the body's own power-off sequence, decoded from
+`software/data/startup_shutdown.txt` and documented in
+[`/protocol`](/protocol#shutdown-sequence):
+
+1. turn OIS off (`0x20` payload 0 + execute),
+2. park (`0x28` channel `0x8001` + `0x10` + execute),
+3. poll status at the burst period until the busy bit clears — 129 ms in the
+   capture, bounded by `--shutdown-timeout` (default 1.5 s),
+4. read the final focus and iris back, reported as `EVT PARKED`,
+5. drop the rail.
+
+The whole thing takes ~250 ms. Commands are still serviced between the status
+polls, so `GET` answers throughout and `SET POWER OFF FORCE` cuts it short.
+
+If the sequence can't run — the lens is mid-boot, or lost transport sync — the
+rail still drops, preceded by `EVT ERROR SHUTDOWN_SKIPPED <reason>`. A park
+that never completes gives `EVT ERROR SHUTDOWN_TIMEOUT` and the rail drops
+anyway. **A `SIGKILL`, a Pi power loss or a pulled plug cannot park the lens**;
+in that case the rail state depends on the external switch's pull-down.
+
+After every successful startup and every resync re-initialization the server
+sends the `0x20` the body sends at that point, with the payload **mirroring the
+lens's own OIS switch** (status `b1` bit 6) — reported as `EVT OIS ON|OFF`.
+It is read, not chosen: sending payload 1 to a lens whose switch is off would
+override the user's switch. `--no-ois-sync` skips the packet entirely.
 
 ## Pi setup
 
@@ -127,14 +166,19 @@ capture; all diagnostics go to stderr so the command stream stays clean.
 
 ### Focus Distance Model
 
-Initial estimate with some noisy data - needs further confirmation.
+Better estimate of the focus/distance curve for the 250mm f/4 lens.  
 
- a lens's focus extension is f²/d, so counts should be linear in 1/d, and panel 2 shows it is:
+Note that the constant offset shifts between lenses, and may reprsent a per-lens manufacturing tolerance, a per- lens/body fit, etc.   Need to test additional lenses.
+
+Lens appears to have 486 counts per mm of movement.
+
+ The lens's focus extension is f²/d, so counts should be linear in 1/d, and panel 2 shows it is:
 
 
 ```
-counts(d) = -381.9 + 28426 / d        d in metres    R² = 0.957, RMSE 37 counts
-d(counts)  = 28426 / (counts + 381.9)
+counts(d) = -56.19 + 30371.9 / d        d in metres    R² = 0.9986, RMSE 14.5 counts
+d(counts)  = 30371.9 / (counts + 56.19)
 ```
 
-Infinity asymptote ≈ −382 counts
+Plots of depth of field and focus model fit from 9 stations:
+![alt text](../analysis/focus_vs_distance_lens3.png)

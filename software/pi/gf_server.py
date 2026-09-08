@@ -17,7 +17,11 @@ Serial link (default /dev/serial0, 115200 8N1, no flow control):
 
     ->  SET POWER ON        <-  OK POWER ON      (accepted; boot is async,
                                                   wait for EVT STATE READY)
-    ->  SET POWER OFF       <-  OK POWER OFF
+    ->  SET POWER OFF       <-  OK POWER OFF     (accepted; the lens is
+                                                  parked first and the rail
+                                                  drops ~250ms later, at
+                                                  EVT STATE OFF)
+    ->  SET POWER OFF FORCE <-  OK POWER OFF     (cut the rail now, no park)
     ->  SET FOCUS -1200     <-  OK FOCUS -1200   (absolute motor counts,
                                                   signed 16-bit; move is async)
     ->  SET IRIS 7          <-  OK IRIS 7        (third-stop index, 1 = wide
@@ -25,7 +29,8 @@ Serial link (default /dev/serial0, 115200 8N1, no flow control):
     ->  GET POWER           <-  OK POWER ON      (ON only once the lens is up)
     ->  GET FOCUS           <-  OK FOCUS -1198   (last position feedback)
     ->  GET IRIS            <-  OK IRIS 7        (last index feedback)
-    ->  GET STATE           <-  OK STATE READY   (OFF|STARTING|READY|RESYNC)
+    ->  GET STATE           <-  OK STATE READY   (OFF|STARTING|READY|RESYNC
+                                                  |STOPPING)
     ->  PING                <-  OK PONG
     ->  HELP                <-  OK HELP SET POWER ON|OFF; ...
 
@@ -36,8 +41,15 @@ Serial link (default /dev/serial0, 115200 8N1, no flow control):
     as EVT ERROR <WHAT>_REJECTED, since acceptance is only known a burst later.
 
     EVT lines: STATE <name>, POWER ON|OFF, FOCUS <pos>, FOCUS_SETTLED <pos>,
-               IRIS <index>, RING FOCUS|APERTURE <delta>, ERROR <text>.
+               IRIS <index>, RING FOCUS|APERTURE <delta>,
+               PARKED <focus> <iris>, ERROR <text>.
                Suppress them with --no-events.
+
+Shutdown replays the body's own power-off sequence (startup_shutdown.txt):
+OIS off, park on 0x28 channel 0x8001, wait for the status busy
+bit to clear, read the final focus/iris back, then drop the rail. SIGTERM
+takes the same path, so `systemctl stop gf-server` and a reboot park the lens
+properly — the unit allows 15s for it.
 
 Wiring and lens-power notes: see gf_controller.py's module docstring. The UART
 adds:
@@ -198,6 +210,7 @@ class LensServer:
 
         self.state = "OFF"
         self.abort_startup = False
+        self.abort_shutdown = False
 
         # lens state, all unknown until feedback arrives
         self.focus_pos: int | None = None
@@ -258,13 +271,17 @@ class LensServer:
         if verb == "PING":
             self.reply("OK PONG")
         elif verb == "HELP":
-            self.reply("OK HELP SET POWER ON|OFF; SET FOCUS <-32768..32767>; "
+            self.reply("OK HELP SET POWER ON|OFF [FORCE]; "
+                       "SET FOCUS <-32768..32767>; "
                        f"SET IRIS <{IRIS_MIN}..{IRIS_MAX}>; "
                        "GET POWER|FOCUS|IRIS|STATE; PING")
         elif verb == "GET" and len(parts) == 2:
             self.handle_get(parts[1])
         elif verb == "SET" and len(parts) == 3:
             self.handle_set(parts[1], parts[2])
+        elif (verb == "SET" and len(parts) == 4
+              and parts[1] == "POWER" and parts[3] == "FORCE"):
+            self.set_power(parts[2], force=True)
         else:
             self.reply(f"ERR SYNTAX {line[:40]!r}")
 
@@ -301,9 +318,10 @@ class LensServer:
         except ValueError:
             self.reply(f"ERR SYNTAX {value!r} is not an integer")
             return
-        if self.state in ("OFF", "STARTING"):
+        if self.state in ("OFF", "STARTING", "STOPPING"):
             self.reply("ERR NOT_READY lens is "
-                       + ("off" if self.state == "OFF" else "starting"))
+                       + {"OFF": "off", "STARTING": "starting",
+                          "STOPPING": "shutting down"}[self.state])
             return
         if what == "FOCUS":
             if not FOCUS_MIN <= n <= FOCUS_MAX:
@@ -320,13 +338,25 @@ class LensServer:
             self.pending_iris = True
             self.reply(f"OK IRIS {n}")
 
-    def set_power(self, value: str) -> None:
+    def set_power(self, value: str, force: bool = False) -> None:
+        """SET POWER ON|OFF, and the SET POWER OFF FORCE escape hatch.
+
+        A plain OFF parks the lens first (the body's shutdown sequence) and
+        drops the rail ~250ms later; FORCE cuts immediately, for a lens that
+        is wedged or a host that needs the rail down now."""
         if value not in ("ON", "OFF"):
             self.reply(f"ERR SYNTAX POWER {value!r} (want ON or OFF)")
             return
+
         if value == "ON":
+            if force:
+                self.reply("ERR SYNTAX FORCE applies to SET POWER OFF only")
+                return
             if not self.power.enabled:
                 self.reply("ERR NO_POWER_GPIO lens power switch unavailable")
+                return
+            if self.state == "STOPPING":
+                self.reply("ERR NOT_READY lens is shutting down")
                 return
             if self.state != "OFF":
                 self.reply("OK POWER ON")   # already on or coming up
@@ -335,11 +365,29 @@ class LensServer:
             self.abort_startup = False
             self.set_state("STARTING")
             self.event("POWER ON")
-        else:
-            self.reply("OK POWER OFF")
-            if self.state == "STARTING":
-                self.abort_startup = True   # picked up between replay attempts
+            return
+
+        self.reply("OK POWER OFF")
+        if force:
+            if self.state not in ("OFF",):
+                self.event("ERROR SHUTDOWN_SKIPPED forced")
+            self.abort_shutdown = True      # cuts a park already in progress
             self.power_down()
+        elif self.state == "READY":
+            self.set_state("STOPPING")      # run() picks it up next iteration
+        elif self.state == "STOPPING":
+            pass                            # already parking
+        elif self.state == "STARTING":
+            self.abort_startup = True       # picked up between replay attempts
+            self.event("ERROR SHUTDOWN_SKIPPED lens was still booting")
+            self.power_down()
+        elif self.state == "RESYNC":
+            # no working transport to shut down over; the dialogue would only
+            # answer with the resync marker
+            self.event("ERROR SHUTDOWN_SKIPPED lens lost transport sync")
+            self.power_down()
+        else:
+            self.power_down()               # already off
 
     def power_down(self) -> None:
         """Cut lens power and forget everything the lens told us: it reboots
@@ -404,9 +452,25 @@ class LensServer:
         self.event("ERROR STARTUP_FAILED no lens identification")
         self.power_down()
 
+    def sync_ois(self) -> None:
+        """Send the 0x20 the body sends after identification, with the payload
+        matching the lens's own OIS switch (gf_controller.sync_ois)."""
+        if self.args.no_ois_sync:
+            return
+
+        result = gf.sync_ois(self.sess)
+        if result in ("on", "off"):
+            print(f"  t={self.sess.now():8.3f} OIS {result} (switch position)")
+            self.event(f"OIS {result.upper()}")
+        elif result == "rejected":
+            self.event("ERROR OIS_REJECTED 0x20 not acknowledged")
+        else:
+            self.event("ERROR OIS_UNKNOWN could not read the switch position")
+
     def enter_idle(self) -> None:
         """Hand over to the burst loop, asking for one round of feedback so
         GET FOCUS / GET IRIS answer as soon as the lens is up."""
+        self.sync_ois()
         self.sess.start_phase()
         self.next_burst = gf.IDLE_PERIOD_S
         self.burst_i = 0
@@ -414,6 +478,66 @@ class LensServer:
         self.focus_poll_left = RING_POLL_BURSTS
         self.focus_settle_prev = None
         self.set_state("READY")
+
+    # -- phase 3: shut the lens down ---------------------------------------
+
+    def do_shutdown(self) -> None:
+        """Run the body's park sequence, then drop the rail.
+
+        Blocks for as long as the park takes (~250ms in the capture, bounded
+        by --shutdown-timeout), but keeps servicing commands between status
+        polls so GET still answers and SET POWER OFF FORCE can cut it short."""
+
+        def on_poll() -> bool:
+            self.drain_commands()
+            return self.abort_shutdown
+
+        self.abort_shutdown = False
+        try:
+            info = gf.run_shutdown(self.sess,
+                                   timeout=self.args.shutdown_timeout,
+                                   on_poll=on_poll)
+        except Exception as exc:            # never leave the lens energized
+            print(f"shutdown sequence raised: {exc}")
+            self.event(f"ERROR SHUTDOWN_FAILED {exc}")
+            self.power_down()
+            return
+
+        status = info["status"]
+        problem = {
+            "timeout": "SHUTDOWN_TIMEOUT park did not finish in "
+                       f"{self.args.shutdown_timeout:.1f}s",
+            "rejected": "SHUTDOWN_REJECTED lens did not accept the park",
+            "unreachable": "SHUTDOWN_UNREACHABLE lens stopped answering",
+            "aborted": "SHUTDOWN_ABORTED forced off mid-park",
+        }.get(status)
+        if problem:
+            self.event(f"ERROR {problem}")
+        # the readout runs on every path that reached it, so report whatever
+        # positions came back even when the park itself went badly
+        if info["focus"] is not None:
+            self.event(f"FOCUS {info['focus']}")
+        if info["iris"] is not None:
+            self.event(f"IRIS {info['iris']}")
+        if status == "ok":
+            focus = "?" if info["focus"] is None else info["focus"]
+            iris = "?" if info["iris"] is None else info["iris"]
+            self.event(f"PARKED {focus} {iris}")
+        self.power_down()
+
+    def stop_lens(self) -> None:
+        """Wind the lens down on the way out (SIGTERM, systemd stop, unwind).
+        Always ends with the rail low."""
+        if self.state in ("READY", "STOPPING"):
+            print("parking the lens before exit")
+            self.set_state("STOPPING")
+            self.do_shutdown()
+        else:
+            if self.state == "RESYNC":
+                self.event("ERROR SHUTDOWN_SKIPPED lens lost transport sync")
+            elif self.state == "STARTING":
+                self.event("ERROR SHUTDOWN_SKIPPED lens was still booting")
+            self.power_down()
 
     # -- phase 2: idle bursts ----------------------------------------------
 
@@ -614,6 +738,7 @@ class LensServer:
                 self.magic_mode = False
                 sess.counter = gf.next_counter_after(self.replay)
                 self.set_state("READY")
+                self.sync_ois()   # the re-init reset the 0x20 state
             else:
                 self.resync_cooldown = 2
         else:
@@ -629,6 +754,7 @@ class LensServer:
                     self.magic_mode = False
                     sess.counter = gf.next_counter_after(self.replay)
                     self.set_state("READY")
+                    self.sync_ois()
                 else:
                     self.resync_cooldown = 25   # ~1s between attempts
         # run_startup reset the phase clock either way; realign the schedule
@@ -648,6 +774,8 @@ class LensServer:
                 break
             if self.state == "STARTING":
                 self.do_startup()
+            elif self.state == "STOPPING":
+                self.do_shutdown()
             elif self.state in ("READY", "RESYNC"):
                 self.burst()
             else:
@@ -665,13 +793,13 @@ def main() -> None:
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--replay", type=Path,
                     default=Path(__file__).parent / "startup_replay.json")
-    ap.add_argument("--replay-end", type=int, default=64,
+    ap.add_argument("--replay-end", type=int, default=20,
                     help="replay only the first N captured transactions "
-                         "(default 64, the deterministic config prefix)")
+                         "(default 20, the deterministic config prefix)")
     ap.add_argument("--bus", type=int, default=0)
     ap.add_argument("--device", type=int, default=0)
-    ap.add_argument("--settle", type=float, default=1.4,
-                    help="bus silence after lens power-on (default 1.4)")
+    ap.add_argument("--settle", type=float, default=0,
+                    help="bus silence after lens power-on (default 0)")
     ap.add_argument("--startup-retries", type=int, default=5)
     ap.add_argument("--retry-delay", type=float, default=1.4)
     ap.add_argument("--abort-txn", type=int, default=20,
@@ -681,6 +809,11 @@ def main() -> None:
                     help="substring a real identification must contain")
     ap.add_argument("--power-gpio", type=int, default=17,
                     help="GPIO driving the lens-power switch (default 17)")
+    ap.add_argument("--no-ois-sync", action="store_true",
+                    help="skip the 0x20 OIS-state packet after startup")
+    ap.add_argument("--shutdown-timeout", type=float, default=0.5,
+                    help="seconds to wait for the park to complete before "
+                         "cutting power anyway (default 0.5)")
     ap.add_argument("--no-events", action="store_true",
                     help="reply to commands only; no unsolicited EVT lines")
     ap.add_argument("--transcript", type=Path,
@@ -714,8 +847,8 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        print("shutting down — cutting lens power")
-        server.power_down()
+        print("server exiting")
+        server.stop_lens()
         power.close()
         sess.close()
         port.close()
