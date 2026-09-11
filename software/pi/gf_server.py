@@ -9,7 +9,7 @@ link. Power-on runs the same startup replay + idle engine as gf_controller.py
 continuously, servicing serial commands at burst boundaries and emitting
 unsolicited status events as the lens reports them.
 
-Serial link (default /dev/serial0, 115200 8N1, no flow control):
+Serial link (default /dev/serial0, 9600 8N1, no flow control):
 
     ASCII lines, terminated with LF or CRLF, case-insensitive, <= 128 chars.
     Every command produces exactly one reply line, `OK ...` or `ERR ...`.
@@ -60,12 +60,12 @@ adds:
 
 /dev/serial0 is the primary UART; free it from the login console first
 (`sudo raspi-config` -> Interface -> Serial: login shell NO, hardware YES, or
-drop `console=serial0,115200` from /boot/firmware/cmdline.txt and add
+drop `console=serial0,9600` from /boot/firmware/cmdline.txt and add
 `enable_uart=1` to config.txt). Needs python3-serial, python3-spidev,
 python3-lgpio.
 
 Usage:
-    python3 gf_server.py                       # /dev/serial0 @ 115200
+    python3 gf_server.py                       # /dev/serial0 @ 9600
     python3 gf_server.py --port - --dry-run    # protocol test on stdin/stdout
     python3 gf_server.py --baud 9600 --no-events
 """
@@ -985,7 +985,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", default="/dev/serial0",
                     help="command UART (default /dev/serial0; '-' = stdio)")
-    ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--baud", type=int, default=9600)
     ap.add_argument("--replay", type=Path,
                     default=Path(__file__).parent / "startup_replay.json")
     ap.add_argument("--replay-end", type=int, default=20,
