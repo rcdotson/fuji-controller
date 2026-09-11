@@ -30,7 +30,7 @@ Serial link (default /dev/serial0, 115200 8N1, no flow control):
     ->  GET FOCUS           <-  OK FOCUS -1198   (last position feedback)
     ->  GET IRIS            <-  OK IRIS 7        (last index feedback)
     ->  GET STATE           <-  OK STATE READY   (OFF|STARTING|READY|RESYNC
-                                                  |STOPPING)
+                                                  |STOPPING|FAULT)
     ->  PING                <-  OK PONG
     ->  HELP                <-  OK HELP SET POWER ON|OFF; ...
 
@@ -42,7 +42,7 @@ Serial link (default /dev/serial0, 115200 8N1, no flow control):
 
     EVT lines: STATE <name>, POWER ON|OFF, FOCUS <pos>, FOCUS_SETTLED <pos>,
                IRIS <index>, RING FOCUS|APERTURE <delta>,
-               PARKED <focus> <iris>, ERROR <text>.
+               PARKED <focus> <iris>, RESYNC_POWER_CYCLE, ERROR <text>.
                Suppress them with --no-events.
 
 Shutdown replays the body's own power-off sequence (startup_shutdown.txt):
@@ -90,6 +90,7 @@ FOCUS_MIN, FOCUS_MAX = -32768, 32767
 MAX_LINE = 128
 FOCUS_SETTLE_BURSTS = 12   # position polls granted after a commanded move
 RING_POLL_BURSTS = 3       # position polls after the ring is turned by hand
+DRIVE_HOLD_BURSTS = 25     # longest a staged drive waits for the lens to settle
 
 
 # ---------------------------------------------------------------------------
@@ -193,8 +194,9 @@ class LensServer:
     The engine is a state machine stepped from run(): OFF idles cheaply,
     STARTING replays the body's power-on sequence (abortable by SET POWER
     OFF between attempts), READY runs gf_controller's request-quad burst
-    loop, and RESYNC is READY while the lens is being coaxed back from the
-    transport marker.
+    loop, RESYNC is READY while the lens is being coaxed back from the
+    transport marker (see recover), and FAULT is the rail down after that
+    recovery ladder ran out — only SET POWER ON leaves it.
     """
 
     def __init__(self, sess: gf.BodySession, power: gf.LensPower,
@@ -222,15 +224,22 @@ class LensServer:
         self.want_iris_feedback = False
         self.focus_poll_left = 0
         self.focus_settle_prev: int | None = None
+        self.drive_held = 0
 
         # burst bookkeeping (mirrors gf_controller.run_idle)
         self.burst_i = 0
         self.next_burst = 0.0
         self.last_status: str | None = None
+        self.last_status_rx: bytes | None = None
         self.last_09: bytes | None = None
         self.magic_mode = False
         self.resync_cooldown = 0
-        self.reset_fails = 0
+        # recovery ladder: reset-dialogue failures, then re-init failures,
+        # then power cycles. Each rung only escalates when the one below it
+        # has genuinely run out of attempts.
+        self.dialogue_fails = 0
+        self.reinit_fails = 0
+        self.power_cycles = 0
 
     # -- output ------------------------------------------------------------
 
@@ -290,7 +299,7 @@ class LensServer:
             # ON from the moment the rail is raised, so a host polling after
             # SET POWER ON sees ON while the lens is still booting; STATE
             # distinguishes STARTING from READY
-            self.reply(f"OK POWER {'OFF' if self.state == 'OFF' else 'ON'}")
+            self.reply(f"OK POWER {'OFF' if self.state in ('OFF', 'FAULT') else 'ON'}")
         elif what == "STATE":
             self.reply(f"OK STATE {self.state}")
         elif what == "FOCUS":
@@ -318,10 +327,12 @@ class LensServer:
         except ValueError:
             self.reply(f"ERR SYNTAX {value!r} is not an integer")
             return
-        if self.state in ("OFF", "STARTING", "STOPPING"):
+        if self.state in ("OFF", "STARTING", "STOPPING", "FAULT"):
             self.reply("ERR NOT_READY lens is "
                        + {"OFF": "off", "STARTING": "starting",
-                          "STOPPING": "shutting down"}[self.state])
+                          "STOPPING": "shutting down",
+                          "FAULT": "in a fault state; SET POWER ON to retry"
+                          }[self.state])
             return
         if what == "FOCUS":
             if not FOCUS_MIN <= n <= FOCUS_MAX:
@@ -358,9 +369,13 @@ class LensServer:
             if self.state == "STOPPING":
                 self.reply("ERR NOT_READY lens is shutting down")
                 return
-            if self.state != "OFF":
+            if self.state not in ("OFF", "FAULT"):
                 self.reply("OK POWER ON")   # already on or coming up
                 return
+            # FAULT means the rail is already down and the recovery ladder
+            # gave up; an explicit SET POWER ON is the operator retrying, so
+            # clear the ladder and start from cold
+            self.dialogue_fails = self.reinit_fails = self.power_cycles = 0
             self.reply("OK POWER ON")
             self.abort_startup = False
             self.set_state("STARTING")
@@ -394,13 +409,12 @@ class LensServer:
         from scratch, so cached focus/iris feedback is no longer true."""
         self.power.set(False)
         self.sess.link.disarm()
-        self.focus_pos = self.focus_target = self.iris_index = None
-        self.pending_focus = self.pending_iris = False
-        self.want_iris_feedback = False
-        self.focus_poll_left = 0
-        self.last_status = self.last_09 = None
+        self.forget_lens_state()
+        self.focus_target = None            # deliberate power off: no intent
         self.magic_mode = False
-        self.resync_cooldown = self.reset_fails = 0
+        self.resync_cooldown = 0
+        # an operator-driven power down is a clean slate for the ladder too
+        self.dialogue_fails = self.reinit_fails = self.power_cycles = 0
         if self.state != "OFF":
             self.event("POWER OFF")
         self.set_state("OFF")
@@ -417,10 +431,47 @@ class LensServer:
             time.sleep(min(0.02, max(0.0, end - time.perf_counter())))
         return True
 
+    def attempt_startup(self, attempts: int, reboot_first: bool = False,
+                        label: str = "startup") -> bool | None:
+        """Replay the startup prefix up to `attempts` times, dropping SCLK low
+        for the lens's reboot window between tries.
+
+        That SCLK low->high edge is the part that matters: a cold boot
+        routinely fails the first replay and succeeds on the second, once the
+        lens has had its ~1.34s reboot window. Recovery needs it exactly as
+        much, so both callers come through here rather than calling
+        gf.run_startup bare — which also kept expect_ident's bootloader-beacon
+        rejection out of the recovery path.
+
+        Returns True if the lens identified, False if it never did, and None
+        if a SET POWER OFF or shutdown arrived and the caller should stand
+        down. `reboot_first` gives the first attempt a reboot window too, for
+        callers whose link is already armed (i.e. mid-session recovery).
+        """
+        args = self.args
+        for attempt in range(1, attempts + 1):
+            if attempt > 1 or reboot_first:
+                print(f"{label} attempt {attempt} of {attempts}: SCLK low "
+                      f"{args.retry_delay:.2f}s (lens reboot window)")
+                self.sess.counter = 8
+                self.sess.link.disarm()
+                if not self.sleep_abortable(args.retry_delay):
+                    return None
+            self.sess.link.arm()
+            if gf.run_startup(self.sess, self.replay, args.abort_txn or None,
+                              args.expect_ident or None):
+                self.sess.counter = gf.next_counter_after(self.replay)
+                return True
+            self.drain_commands()
+            if self.abort_startup or self.stop.is_set():
+                return None
+        return False
+
     def do_startup(self) -> None:
-        """Replay the body's power-on sequence, retrying on the lens's reboot
-        cadence (gf_controller.run_startup_with_retry, unrolled so commands
-        are serviced and SET POWER OFF can abort between attempts)."""
+        """Bring the lens up from cold: raise the rail, let it settle, then
+        replay the body's power-on sequence (gf_controller.run_startup_with_retry,
+        unrolled so commands are serviced and SET POWER OFF can abort between
+        attempts)."""
         args = self.args
         print(f"lens power ON (GPIO{self.power.gpio}); settling "
               f"{args.settle:.2f}s with SCLK held low...")
@@ -429,24 +480,12 @@ class LensServer:
         if not self.sleep_abortable(args.settle):
             return
 
-        attempts = max(0, args.startup_retries) + 1
-        for attempt in range(1, attempts + 1):
-            if attempt > 1:
-                print(f"startup attempt {attempt} of {attempts}: SCLK low "
-                      f"{args.retry_delay:.2f}s (lens reboot window)")
-                self.sess.counter = 8
-                self.sess.link.disarm()
-                if not self.sleep_abortable(args.retry_delay):
-                    return
-            self.sess.link.arm()
-            if gf.run_startup(self.sess, self.replay, args.abort_txn or None,
-                              args.expect_ident or None):
-                self.sess.counter = gf.next_counter_after(self.replay)
-                self.enter_idle()
-                return
-            self.drain_commands()
-            if self.abort_startup or self.stop.is_set():
-                return
+        ok = self.attempt_startup(max(0, args.startup_retries) + 1)
+        if ok is None:
+            return
+        if ok:
+            self.enter_idle()
+            return
 
         print("WARNING: no lens identification — cutting power")
         self.event("ERROR STARTUP_FAILED no lens identification")
@@ -467,6 +506,12 @@ class LensServer:
         else:
             self.event("ERROR OIS_UNKNOWN could not read the switch position")
 
+    def actuators_busy(self) -> bool:
+        """True while the last status said an actuator is moving or not yet
+        ready — the window in which a fresh staged drive desyncs the lens."""
+        rx = self.last_status_rx
+        return rx is not None and (gf.status_busy(rx) or gf.status_disabled(rx))
+
     def enter_idle(self) -> None:
         """Hand over to the burst loop, asking for one round of feedback so
         GET FOCUS / GET IRIS answer as soon as the lens is up."""
@@ -477,6 +522,8 @@ class LensServer:
         self.want_iris_feedback = True
         self.focus_poll_left = RING_POLL_BURSTS
         self.focus_settle_prev = None
+        # the lens is up: the recovery ladder starts from the bottom again
+        self.dialogue_fails = self.reinit_fails = self.power_cycles = 0
         self.set_state("READY")
 
     # -- phase 3: shut the lens down ---------------------------------------
@@ -564,6 +611,7 @@ class LensServer:
                     print(f"  t={self.sess.now():8.3f} focus position: {pos}")
                 return reqs
             status = gf.describe_status(rx)
+            self.last_status_rx = rx
             if status and status != self.last_status:
                 print(f"  t={self.sess.now():8.3f} lens status: {status}")
                 self.last_status = status
@@ -664,7 +712,10 @@ class LensServer:
 
         hit_magic = self.run_quads(requests)
 
-        if self.focus_poll_left and not self.pending_focus:
+        # settle tracking runs even with a command pending: a pending drive
+        # now waits for the move to land, so freezing the countdown here
+        # would mean it never lands and the drive never goes out
+        if self.focus_poll_left:
             self.focus_poll_left -= 1
             settled = (self.focus_pos is not None
                        and self.focus_pos == self.focus_settle_prev)
@@ -677,7 +728,26 @@ class LensServer:
             self.focus_settle_prev = self.focus_pos
 
         quiet = not hit_magic and not self.magic_mode
-        if self.pending_iris and quiet:
+        # A staged 0x15/0x18 drive started while the previous one is still
+        # running is what desyncs the lens: it flags the sequence
+        # (0d 08 95 5a), run_sequence aborts, and the half-open quad drops it
+        # to the resync marker. SSAv2's AGL loop re-commands focus several
+        # times a second, so hold the newest target and issue it on the first
+        # burst after the move lands — latest target wins, nothing is dropped.
+        moving = self.focus_poll_left > 0 or self.actuators_busy()
+        if moving and (self.pending_focus or self.pending_iris):
+            # ...but never hold one forever: a ring being turned by hand keeps
+            # refreshing focus_poll_left, and the host's target still has to
+            # land eventually
+            self.drive_held += 1
+            if self.drive_held > DRIVE_HOLD_BURSTS:
+                print(f"  t={sess.now():8.3f} lens still busy after "
+                      f"{self.drive_held} bursts — issuing the held command")
+                moving = False
+        else:
+            self.drive_held = 0
+
+        if self.pending_iris and quiet and not moving:
             # control writes ride at the end of a burst, after the polls,
             # like the captured body's drive sequences do
             self.pending_iris = False
@@ -688,11 +758,11 @@ class LensServer:
                 self.want_iris_feedback = True
             else:
                 self.event(f"ERROR IRIS_REJECTED {self.iris_target}")
-        elif self.pending_iris:
+        elif self.pending_iris and not quiet:
             self.pending_iris = False
             self.event(f"ERROR IRIS_DROPPED {self.iris_target} lens resyncing")
 
-        if self.pending_focus and quiet:
+        if self.pending_focus and quiet and not moving:
             self.pending_focus = False
             time.sleep(gf.INTRA_BURST_GAP_S)
             print(f"  t={sess.now():8.3f} commanding focus to "
@@ -702,7 +772,7 @@ class LensServer:
                 self.focus_settle_prev = None
             else:
                 self.event(f"ERROR FOCUS_REJECTED {self.focus_target}")
-        elif self.pending_focus:
+        elif self.pending_focus and not quiet:
             self.pending_focus = False
             self.event(f"ERROR FOCUS_DROPPED {self.focus_target} lens resyncing")
 
@@ -715,9 +785,24 @@ class LensServer:
         self.next_burst += gf.IDLE_PERIOD_S
 
     def recover(self) -> None:
-        """Marker recovery, per run_idle: complete the transport-reset
-        dialogue, re-initialize, and escalate to the startup prefix if the
-        marker persists."""
+        """Coax the lens back from the resync marker, escalating until it
+        comes back or the ladder runs out.
+
+        The rungs, in order, each tried --resync-retries times:
+
+          1. the transport-reset dialogue (the lens lost transport sync)
+          2. a re-init through attempt_startup, which drops SCLK low for the
+             lens's reboot window first — the step a bare run_startup skips,
+             and the one that makes a cold boot's second attempt succeed
+          3. a power cycle, because the marker does not only mean "please
+             reset the transport": decode_ident calls the same word the
+             bootloader beacon, and a lens that has reset into its bootloader
+             has no application to resync, so nothing on the bus reaches it
+          4. STATE FAULT with the rail down, rather than hammering the bus
+             forever — which is what the old ladder did, because reset_fails
+             was zeroed on every dialogue "success" and never counted a
+             failed re-init, so the escalation was unreachable.
+        """
         sess = self.sess
         if not self.magic_mode:
             self.magic_mode = True
@@ -726,40 +811,146 @@ class LensServer:
             self.set_state("RESYNC")
         if self.resync_cooldown:
             return
+
+        tries = max(1, self.args.resync_retries)
         time.sleep(gf.INTRA_BURST_GAP_S)
-        if gf.transport_reset(sess):
-            self.reset_fails = 0
-            # the dialogue leaves the lens awaiting init; polling it there
-            # just re-markers it, so re-run the startup prefix first
-            print(f"  t={sess.now():8.3f} transport reset complete "
-                  "— re-initializing")
-            time.sleep(gf.INTRA_BURST_GAP_S)
-            if gf.run_startup(sess, self.replay):
-                self.magic_mode = False
-                sess.counter = gf.next_counter_after(self.replay)
-                self.set_state("READY")
-                self.sync_ois()   # the re-init reset the 0x20 state
-            else:
-                self.resync_cooldown = 2
-        else:
-            self.reset_fails += 1
-            if self.reset_fails <= 2:
-                self.resync_cooldown = 2
-            else:
-                self.reset_fails = 0
-                print(f"  t={sess.now():8.3f} marker persists — re-running "
-                      "startup prefix")
+
+        if self.dialogue_fails < tries:
+            if gf.transport_reset(sess):
+                self.dialogue_fails = 0
+                # the dialogue leaves the lens awaiting init; polling it there
+                # just re-markers it, so re-run the startup prefix first
+                print(f"  t={sess.now():8.3f} transport reset complete "
+                      "— re-initializing")
                 time.sleep(gf.INTRA_BURST_GAP_S)
-                if gf.run_startup(sess, self.replay):
-                    self.magic_mode = False
-                    sess.counter = gf.next_counter_after(self.replay)
-                    self.set_state("READY")
-                    self.sync_ois()
-                else:
-                    self.resync_cooldown = 25   # ~1s between attempts
-        # run_startup reset the phase clock either way; realign the schedule
-        self.next_burst = sess.phase_now()
+                if self.reinit(1):
+                    return
+                # give the lens a couple of bursts before the next rung
+                self.resync_cooldown = 2
+                return
+            else:
+                self.dialogue_fails += 1
+                self.resync_cooldown = 2
+                return
+
+        # the dialogue is not getting us anywhere: re-initialize properly,
+        # with the SCLK-low reboot window in front of each attempt
+        if self.reinit_fails < tries:
+            print(f"  t={sess.now():8.3f} marker persists — re-running the "
+                  "startup prefix with a reboot window")
+            if self.reinit(tries):
+                return
+            self.resync_cooldown = 25       # ~1s before the next rung
+            return
+
+        # nothing on the bus reaches it; do what the operator does by hand
+        if self.power_cycles < max(0, self.args.max_power_cycles):
+            self.power_cycles += 1
+            if self.power_cycle():
+                return
+            self.resync_cooldown = 25
+            return
+
+        print(f"  t={sess.now():8.3f} lens unrecoverable after "
+              f"{self.power_cycles} power cycle(s) — cutting power")
+        self.event("ERROR RESYNC_FAILED lens did not come back")
+        self.power.set(False)
+        self.sess.link.disarm()
+        self.forget_lens_state()
+        self.set_state("FAULT")
+
+    def reinit(self, attempts: int) -> bool:
+        """Re-run the startup prefix mid-session and, if the lens identifies,
+        put the burst loop back to work. Counts its own failures so the
+        ladder in recover() can move on."""
+        ok = self.attempt_startup(attempts, reboot_first=True, label="re-init")
+        # attempt_startup reset the phase clock either way; realign the
+        # schedule now, or a stale one stalls the next burst for seconds
+        self.next_burst = self.sess.phase_now()
         self.burst_i = 0
+        if ok:
+            self.magic_mode = False
+            self.dialogue_fails = self.reinit_fails = 0
+            self.enter_idle()               # also re-sends the 0x20 OIS state
+            self.restore_targets()
+            return True
+        if ok is None:
+            return True                     # aborted by the host; stop here
+        self.reinit_fails += 1
+        return False
+
+    def power_cycle(self) -> bool:
+        """Drop the rail, wait, and bring the lens up from cold — the recovery
+        the operator does by hand when the lens will not resync.
+
+        True if the lens came back or the host took the lens off us mid-cycle;
+        False only if the cycle genuinely failed to revive it."""
+        args = self.args
+        if not self.power.enabled:
+            self.event("ERROR RESYNC_NO_POWER_GPIO cannot power cycle")
+            return False
+        print(f"  t={self.sess.now():8.3f} power cycling the lens "
+              f"({self.power_cycles} of {args.max_power_cycles}) — rail down "
+              f"for {args.power_cycle_delay:.1f}s")
+        self.event("RESYNC_POWER_CYCLE")
+
+        self.power.set(False)
+        self.sess.link.disarm()
+        self.forget_lens_state()
+        if not self.sleep_abortable(args.power_cycle_delay) or self.handed_off():
+            return True                     # host cut in; it owns the lens now
+
+        print(f"lens power ON (GPIO{self.power.gpio}); settling "
+              f"{args.settle:.2f}s with SCLK held low...")
+        self.power.set(True)
+        if not self.sleep_abortable(args.settle) or self.handed_off():
+            return True
+
+        ok = self.attempt_startup(max(0, args.startup_retries) + 1,
+                                  label="post-power-cycle startup")
+        self.next_burst = self.sess.phase_now()
+        self.burst_i = 0
+        if ok:
+            self.magic_mode = False
+            self.dialogue_fails = self.reinit_fails = 0
+            self.enter_idle()
+            self.restore_targets()
+            return True
+        return ok is None                   # None = aborted, not a failure
+
+    def handed_off(self) -> bool:
+        """True once a command has taken the lens out of recovery — SET POWER
+        OFF while we were in RESYNC drops the rail and goes to OFF, and the
+        cycle must not quietly power it back up underneath that."""
+        return self.state not in ("RESYNC", "READY") or self.stop.is_set()
+
+    def forget_lens_state(self) -> None:
+        """Drop everything the lens told us. It reboots from scratch across a
+        power cycle, so cached focus/iris feedback is no longer true.
+
+        The host's *targets* are intent, not feedback, so they survive — see
+        restore_targets, which puts the lens back where it was asked to be
+        once it comes back."""
+        self.focus_pos = self.iris_index = None
+        self.pending_focus = self.pending_iris = False
+        self.want_iris_feedback = False
+        self.focus_poll_left = 0
+        self.focus_settle_prev = None
+        self.drive_held = 0
+        self.last_status = self.last_09 = self.last_status_rx = None
+
+    def restore_targets(self) -> None:
+        """Re-apply the host's last focus/iris after the lens rebooted.
+
+        A recovered lens comes up at its own defaults, and the host will not
+        necessarily re-send: SSAv2's AGL loop suppresses a repeat command
+        through its own deadband, so without this the lens would sit at the
+        wrong focus and nothing upstream would notice."""
+        if self.focus_target is not None:
+            self.pending_focus = True
+        self.pending_iris = True
+        print(f"  t={self.sess.now():8.3f} restoring focus "
+              f"{self.focus_target} / iris {self.iris_target} after the reboot")
 
     # -- main loop ---------------------------------------------------------
 
@@ -802,6 +993,15 @@ def main() -> None:
                     help="bus silence after lens power-on (default 0)")
     ap.add_argument("--startup-retries", type=int, default=5)
     ap.add_argument("--retry-delay", type=float, default=1.4)
+    ap.add_argument("--resync-retries", type=int, default=2,
+                    help="reset-dialogue attempts before re-initializing, and "
+                         "re-init attempts before power cycling (default 2)")
+    ap.add_argument("--power-cycle-delay", type=float, default=3.0,
+                    help="seconds the rail stays down in an automatic resync "
+                         "power cycle (default 3.0)")
+    ap.add_argument("--max-power-cycles", type=int, default=2,
+                    help="automatic power cycles before giving up and going "
+                         "to STATE FAULT (default 2)")
     ap.add_argument("--abort-txn", type=int, default=20,
                     help="abort a startup attempt if no identification by "
                          "this transaction (0 disables)")

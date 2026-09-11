@@ -618,40 +618,67 @@ def transport_reset(sess: BodySession) -> bool:
     (e.g. 00 f3 03 e8) that earlier recovery attempts left unacknowledged,
     which kept the lens in marker state. Every ACK is framed with its own
     transport packet, matching the per-request framing the real body uses
-    everywhere. Success = the lens stopped streaming the marker and spoke
-    at least one valid packet."""
+    everywhere.
+
+    Success is the two answers the dialogue actually produces — the lens's
+    ACK of the 0x28 (08 00 a8 36) and its 0x03 error report (00 f3 03 e8),
+    both seen with no marker in between. Anything weaker is not evidence:
+    an all-zero read is an undriven bus, i.e. the lens not answering at all,
+    and counting that as "stopped streaming the marker" is what let this
+    return True against a lens that was still fully in marker state."""
     queue = [MAGIC_REPLY, PKT_2824, transport(0x08), IDLE_PKT,
              pkt(0x08, 0x00, 0xA8)]  # 08 00 a8 36: ack of the lens's a8 reply
     n = 9  # dialogue transport counters restart at 8; transport(8) used above
-    marker_free = 0
-    got_valid = False
+    marker_free = 0     # valid packets spoken since the last marker
+    silent = 0          # consecutive all-zero reads
+    saw_28_ack = False
+    saw_03_report = False
     slots = busy = 0
-    while (queue or marker_free < 3) and slots < 24:
+    while (queue or marker_free < 3) and slots < 24 and silent < 8:
         tx = queue.pop(0) if queue else IDLE_PKT
         if slots:
             time.sleep(INTRA_BURST_GAP_S)
         rx = sess.xfer(tx)
         slots += 1
         if rx == MAGIC_WORD:
-            marker_free = 0
+            # back in marker state: whatever the dialogue had achieved did
+            # not take, so the evidence so far does not count
+            marker_free = silent = 0
+            saw_28_ack = saw_03_report = False
             continue
+        if not any(rx):
+            # nobody driving MISO. Not the marker, but not the lens either:
+            # it neither clears the marker run nor proves recovery, and a
+            # long silent stretch means the lens is not listening at all.
+            silent += 1
+            continue
+        silent = 0
+        if not valid_pkt(rx):
+            continue        # framing noise, not a packet the lens meant
         marker_free += 1
-        if valid_pkt(rx) and any(rx):
-            got_valid = True
-            if rx[2] & 0x80:
-                # busy flag: repeat the same packet until the ack is clean
-                # (attempt_6 showed 08 10 a8 06 mid-dialogue — the lens
-                # asking us to wait, per the captured body's retry behavior)
-                if rx[1] & 0x10 and busy < 6:
-                    busy += 1
-                    queue.insert(0, tx)
-            else:
-                queue.extend([transport(n), ack_for(rx)])
-                n = 8 + ((n + 1 - 8) & 0x7)
-                if (rx[2] & 0x7F) == 0x03:
-                    print(f"  t={sess.now():8.3f} lens error report "
-                          f"{rx.hex(' ')} (code {rx[1]:02x}) — acked")
-    if got_valid and marker_free >= 3:
+        if (rx[2] & 0x7F) == 0x28:
+            saw_28_ack = True
+        if rx[2] & 0x80:
+            # busy flag: repeat the same packet until the ack is clean
+            # (attempt_6 showed 08 10 a8 06 mid-dialogue — the lens
+            # asking us to wait, per the captured body's retry behavior)
+            if rx[1] & 0x10 and busy < 6:
+                busy += 1
+                queue.insert(0, tx)
+        else:
+            queue.extend([transport(n), ack_for(rx)])
+            n = 8 + ((n + 1 - 8) & 0x7)
+            if (rx[2] & 0x7F) == 0x03:
+                saw_03_report = True
+                print(f"  t={sess.now():8.3f} lens error report "
+                      f"{rx.hex(' ')} (code {rx[1]:02x}) — acked")
+    ok = saw_28_ack and saw_03_report
+    print(f"  t={sess.now():8.3f} reset dialogue: {slots} slots, "
+          f"0x28 ack {'yes' if saw_28_ack else 'NO'}, "
+          f"0x03 report {'yes' if saw_03_report else 'NO'}, "
+          f"{marker_free} packet(s) since the last marker, {silent} silent "
+          f"— {'recovered' if ok else 'still in marker state'}")
+    if ok:
         sess.counter = n
         return True
     return False
