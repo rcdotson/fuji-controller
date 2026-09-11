@@ -815,7 +815,11 @@ class LensServer:
         tries = max(1, self.args.resync_retries)
         time.sleep(gf.INTRA_BURST_GAP_S)
 
-        if self.dialogue_fails < tries:
+        # the dialogue rung also stands down once the re-inits it feeds have
+        # run out: a dialogue that keeps reporting success while the re-init
+        # keeps failing would otherwise loop here forever, which is the exact
+        # shape of the bug this ladder replaces
+        if self.dialogue_fails < tries and self.reinit_fails < tries:
             if gf.transport_reset(sess):
                 self.dialogue_fails = 0
                 # the dialogue leaves the lens awaiting init; polling it there
