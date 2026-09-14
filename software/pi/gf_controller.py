@@ -32,9 +32,12 @@ Wiring (lens pad numbering per fuji-G-mount/electrical/README.md; all logic 3.3V
     Lens Pin 11   -> Pi GPIO9  (MISO, phys pin 21)   body data in
     CE0 (GPIO8)   -> leave unconnected (the mount has no chip select)
 
-    Lens power (external bench supplies, NOT the Pi):
+    Lens power (external supplies switched by the board, NOT the Pi rails):
     Pin 2 = 5.3V, Pin 3 = 6.7V, Pin 4 = 8.0V (values measured on a GF45;
     a GF250 with OIS may draw substantially more current).
+    GPIO17 (phys pin 11) and GPIO27 (phys pin 13) are the board's two
+    power-switch control lines, active high and always driven together
+    (--power-gpio overrides the pair; see LensPower).
     The camera leaves the bus quiet for ~1.4s after power before the first
     packet; --settle reproduces that delay after this script starts.
 
@@ -45,10 +48,11 @@ During the idle session (tty only), keys drive the lens:
     iris:  `]` stop down a third-stop, `[` open up, `o` wide open (1),
            `c` fully closed (22)
     focus: `m`/`n` step the motor +/-2 counts, `.`/`,` +/-50, `>`/`<` +/-500
-    power: `1` lens power on, `2` off (GPIO6 -> external high-side switch;
-           raised automatically before the settle window at startup, driven
-           low again when the script exits). `2` and script exit both park
-           the lens first — see Phase 3.
+    power: `1` lens power on, `2` off (GPIO17 + GPIO27 -> external high-side
+           switch, both lines driven identically; raised automatically
+           before the settle window at startup, driven low again when the
+           script exits). `2` and script exit both park the lens first —
+           see Phase 3.
     `q` quits
 Iris setpoints are staged with 0x18 and latched with the 3f execute, each
 followed by a feedback poll (00 01 08 82) reading back the landed index.
@@ -76,6 +80,7 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
 SPI_SPEED_HZ = 1_500_000
@@ -245,22 +250,41 @@ class SpiLink:
 
 
 # ---------------------------------------------------------------------------
-# Lens power (external high-side switch driven by a GPIO, active high)
+# Lens power (external high-side switch driven by GPIOs, active high)
 # ---------------------------------------------------------------------------
 
+DEFAULT_POWER_GPIOS = (17, 27)
+
+
+def parse_power_gpios(spec: str) -> list[int]:
+    """Parse a --power-gpio spec ("17,27" or "17 27") into a BCM pin list.
+
+    A negative entry (the conventional "-1") disables power control, as does
+    an empty spec."""
+    pins = [int(tok) for tok in spec.replace(",", " ").split()]
+    return [] if any(pin < 0 for pin in pins) else pins
+
+
 class LensPower:
-    """Drives the external lens-power circuit via a GPIO (default GPIO6).
+    """Drives the external lens-power circuit via one or more GPIOs.
+
+    The current board splits the switch across two control lines
+    (DEFAULT_POWER_GPIOS = GPIO17 and GPIO27). Every line is claimed,
+    written and released identically, so the pair always moves together;
+    an older single-line board still works by passing just one pin.
 
     Uses lgpio directly: gpiozero's default chip lookup fails on this
     kernel's renumbered gpiochips, so the RP1 header bank is found by its
-    54-line signature. The pin is claimed LOW (power off) at start; close()
-    drives it low again, so exiting the script cuts lens power."""
+    54-line signature. The pins are claimed LOW (power off) at start;
+    close() drives them low again, so exiting the script cuts lens power."""
 
-    def __init__(self, gpio: int):
-        self.gpio = gpio
+    def __init__(self, gpios: int | Iterable[int]):
+        if isinstance(gpios, int):
+            gpios = (gpios,)
+        self.gpios = [pin for pin in gpios if pin >= 0]
         self.state = False
         self.h = None
-        if gpio < 0:
+        if not self.gpios:
             return
         try:
             import lgpio  # noqa: PLC0415 -- only needed on the Pi
@@ -274,7 +298,20 @@ class LensPower:
             except lgpio.error:
                 continue
             if lgpio.gpio_get_chip_info(h)[1] >= 54:  # RP1 header bank
-                lgpio.gpio_claim_output(h, gpio, 0)
+                claimed = []
+                try:
+                    for pin in self.gpios:
+                        lgpio.gpio_claim_output(h, pin, 0)
+                        claimed.append(pin)
+                except lgpio.error as exc:
+                    # all or nothing: a half-claimed set would drive the
+                    # switch asymmetrically, so hand the lines back
+                    for pin in claimed:
+                        lgpio.gpio_free(h, pin)
+                    lgpio.gpiochip_close(h)
+                    print(f"lens power: could not claim {self.label} "
+                          f"({exc}) — disabled")
+                    return
                 self.h = h
                 return
             lgpio.gpiochip_close(h)
@@ -284,15 +321,22 @@ class LensPower:
     def enabled(self) -> bool:
         return self.h is not None
 
+    @property
+    def label(self) -> str:
+        """Pin list for log lines, e.g. "GPIO17+GPIO27"."""
+        return "+".join(f"GPIO{pin}" for pin in self.gpios) or "no GPIO"
+
     def set(self, on: bool) -> None:
         if self.h is not None:
-            self._lgpio.gpio_write(self.h, self.gpio, 1 if on else 0)
+            for pin in self.gpios:
+                self._lgpio.gpio_write(self.h, pin, 1 if on else 0)
             self.state = on
 
     def close(self) -> None:
         if self.h is not None:
-            self._lgpio.gpio_write(self.h, self.gpio, 0)
-            self._lgpio.gpio_free(self.h, self.gpio)
+            for pin in self.gpios:
+                self._lgpio.gpio_write(self.h, pin, 0)
+                self._lgpio.gpio_free(self.h, pin)
             self._lgpio.gpiochip_close(self.h)
             self.h = None
 
@@ -1086,7 +1130,7 @@ def run_idle(sess: BodySession, duration: float,
                     run_shutdown(sess)
                 power.set(on)
                 print(f"  t={sess.now():8.3f} lens power "
-                      f"{'ON' if on else 'OFF'} (GPIO{power.gpio})")
+                      f"{'ON' if on else 'OFF'} ({power.label})")
                 if on:
                     print("  (lens boots in ~1.4s; the marker recovery "
                           "will re-init it)")
@@ -1296,11 +1340,14 @@ def main() -> None:
     ap.add_argument("--transcript", type=Path,
                     help="write Saleae-style TSV of the session (byte-accurate "
                          "tx/rx, analyzable with fuji_spi.py)")
-    ap.add_argument("--power-gpio", type=int, default=17,
-                    help="GPIO driving the external lens-power switch "
-                         "(default 6; -1 disables). Raised before the settle "
-                         "window so power->first-packet timing is "
-                         "deterministic; keys 1/2 toggle it in-session")
+    ap.add_argument("--power-gpio", type=parse_power_gpios,
+                    default=list(DEFAULT_POWER_GPIOS),
+                    help="comma-separated GPIOs driving the external "
+                         "lens-power switch (default 17,27 — the current "
+                         "board's two control lines, driven identically; "
+                         "-1 disables). Raised before the settle window so "
+                         "power->first-packet timing is deterministic; keys "
+                         "1/2 toggle them in-session")
     ap.add_argument("--no-ois-sync", action="store_true",
                     help="skip the 0x20 OIS-state packet the body sends after "
                          "identification (payload mirrors the lens's own OIS "
@@ -1322,11 +1369,11 @@ def main() -> None:
     link = SpiLink(args.bus, args.device, args.dry_run)
     sess = BodySession(link, args.transcript)
     kb = Keyboard()
-    power = LensPower(-1 if args.dry_run else args.power_gpio)
+    power = LensPower([] if args.dry_run else args.power_gpio)
     lens_up = False
     try:
         if power.enabled:
-            print(f"lens power ON (GPIO{power.gpio} high); settle window "
+            print(f"lens power ON ({power.label} high); settle window "
                   "provides the boot delay")
             power.set(True)
         ok = run_startup_with_retry(sess, replay, args.settle,

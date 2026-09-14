@@ -2,7 +2,8 @@
 """Headless lens server: drives a G-mount lens over SPI, takes orders over UART.
 
 Runs unattended on the Pi (systemd, see gf-server.service). On start it claims
-the SPI bus and the lens-power GPIO but leaves the lens POWERED OFF and
+the SPI bus and the lens-power GPIOs (17 and 27, driven as one — see
+gf_controller.LensPower) but leaves the lens POWERED OFF and
 un-initialized — nothing is driven until a `SET POWER ON` arrives on the serial
 link. Power-on runs the same startup replay + idle engine as gf_controller.py
 (imported from it, so the protocol logic has one home); the idle loop then runs
@@ -171,7 +172,8 @@ class NullPower:
     """Stand-in for LensPower under --dry-run: reports enabled and remembers
     the requested state so the full state machine can be exercised off-Pi."""
 
-    gpio = -1
+    gpios: tuple[int, ...] = ()
+    label = "dry-run"
     enabled = True
 
     def __init__(self) -> None:
@@ -189,7 +191,7 @@ class NullPower:
 # ---------------------------------------------------------------------------
 
 class LensServer:
-    """Owns the SPI session, the lens power pin, and the command queue.
+    """Owns the SPI session, the lens power pins, and the command queue.
 
     The engine is a state machine stepped from run(): OFF idles cheaply,
     STARTING replays the body's power-on sequence (abortable by SET POWER
@@ -473,7 +475,7 @@ class LensServer:
         unrolled so commands are serviced and SET POWER OFF can abort between
         attempts)."""
         args = self.args
-        print(f"lens power ON (GPIO{self.power.gpio}); settling "
+        print(f"lens power ON ({self.power.label}); settling "
               f"{args.settle:.2f}s with SCLK held low...")
         self.power.set(True)
         self.sess.link.disarm()
@@ -904,7 +906,7 @@ class LensServer:
         if not self.sleep_abortable(args.power_cycle_delay) or self.handed_off():
             return True                     # host cut in; it owns the lens now
 
-        print(f"lens power ON (GPIO{self.power.gpio}); settling "
+        print(f"lens power ON ({self.power.label}); settling "
               f"{args.settle:.2f}s with SCLK held low...")
         self.power.set(True)
         if not self.sleep_abortable(args.settle) or self.handed_off():
@@ -1011,8 +1013,10 @@ def main() -> None:
                          "this transaction (0 disables)")
     ap.add_argument("--expect-ident", default="",
                     help="substring a real identification must contain")
-    ap.add_argument("--power-gpio", type=int, default=17,
-                    help="GPIO driving the lens-power switch (default 17)")
+    ap.add_argument("--power-gpio", type=gf.parse_power_gpios,
+                    default=list(gf.DEFAULT_POWER_GPIOS),
+                    help="comma-separated GPIOs driving the lens-power switch, "
+                         "all driven identically (default 17,27; -1 disables)")
     ap.add_argument("--no-ois-sync", action="store_true",
                     help="skip the 0x20 OIS-state packet after startup")
     ap.add_argument("--shutdown-timeout", type=float, default=0.5,
